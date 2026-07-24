@@ -1,6 +1,6 @@
 module github.com/daeuniverse/outbound
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d
@@ -15,18 +15,19 @@ require (
 	github.com/mzz2017/disk-bloom v1.0.1
 	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
 	github.com/refraction-networking/utls v1.8.2
-	github.com/sagernet/sing v0.6.0
+	github.com/sagernet/sing v0.8.12-0.20260727003324-d096a164bc7f
 	github.com/sagernet/sing-shadowtls v0.2.0
+	github.com/sagernet/sing-snell v0.0.0-20260919065743-e4148a9db725
 	github.com/samber/oops v1.19.4
 	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37
-	golang.org/x/crypto v0.36.0
+	golang.org/x/crypto v0.42.0
 	golang.org/x/exp v0.0.0-20250207012021-f9890c6ad9f3
-	golang.org/x/net v0.38.0
-	golang.org/x/sync v0.12.0
-	golang.org/x/sys v0.31.0
+	golang.org/x/net v0.43.0
+	golang.org/x/sync v0.17.0
+	golang.org/x/sys v0.41.0
 	google.golang.org/grpc v1.57.0
 	google.golang.org/protobuf v1.36.1
 	lukechampine.com/blake3 v1.4.1
@@ -43,6 +44,7 @@ require (
 	github.com/google/pprof v0.0.0-20250208200701-d0013a598941 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+	github.com/metacubex/blake3 v0.1.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
@@ -53,11 +55,13 @@ require (
 	go.opentelemetry.io/otel v1.29.0 // indirect
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
-	golang.org/x/mod v0.23.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
-	golang.org/x/tools v0.29.0 // indirect
+	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230807174057-1744710a1577 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+
+replace github.com/sagernet/sing-snell => github.com/oixcloud3rd/sing-snell v0.0.0-20260919065743-e4148a9db725

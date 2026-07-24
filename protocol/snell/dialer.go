@@ -3,23 +3,33 @@ package snell
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/netip"
+	"strings"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	singSnell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv4"
+	"github.com/sagernet/sing-snell/snellv6"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func init() {
 	protocol.Register("snell", NewDialer)
 }
 
+type client interface {
+	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
+	DialPacketConn(conn net.Conn) (N.NetPacketConn, error)
+}
+
 type Dialer struct {
-	next         netproxy.Dialer
-	proxyAddress string
-	psk          []byte
-	options      ClientOptions
-	v4Pool       *v4Pool
-	v6Mode       v6Mode
-	v6Pool       *v6Pool
+	server        M.Socksaddr
+	transportDial *singDialer
+	client        client
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -36,42 +46,56 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	if err := options.validate(header.Password); err != nil {
 		return nil, err
 	}
+	server, err := parseSocksaddr(header.ProxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("snell: invalid proxy address %q: %w", header.ProxyAddress, err)
+	}
+	transportDial := &singDialer{next: nextDialer, proxyAddress: header.ProxyAddress}
 	dialer := &Dialer{
-		next:         nextDialer,
-		proxyAddress: header.ProxyAddress,
-		psk:          []byte(header.Password),
-		options:      options,
+		server:        server,
+		transportDial: transportDial,
 	}
-	if options.Reuse && (options.Version == Version4 || options.Version == Version5) {
-		dialer.v4Pool = &v4Pool{create: dialer.newV4Record}
-	}
-	if options.Version == Version6 {
-		mode, err := parseV6Mode(options.Mode)
+	psk := []byte(header.Password)
+	userKey := []byte(options.UserKey)
+	switch options.Version {
+	case Version4, Version5:
+		obfsMode, err := singSnell.ParseObfsMode(options.normalizedObfs())
 		if err != nil {
 			return nil, err
 		}
-		dialer.v6Mode = mode
-		if options.Reuse {
-			dialer.v6Pool = &v6Pool{create: dialer.newV6Record}
+		v4Client, err := snellv4.NewClient(snellv4.ClientOptions{
+			PSK:      psk,
+			UserKey:  userKey,
+			Identity: options.Identity,
+			Reuse:    options.Reuse,
+			ObfsMode: obfsMode,
+			ObfsHost: options.ObfsHost,
+			Dialer:   transportDial,
+			Server:   server,
+		})
+		if err != nil {
+			return nil, err
 		}
+		dialer.client = v4Client
+	case Version6:
+		mode, err := snellv6.ParseMode(options.Mode)
+		if err != nil {
+			return nil, err
+		}
+		v6Client, err := snellv6.NewClient(snellv6.ClientOptions{
+			PSK:     psk,
+			UserKey: userKey,
+			Mode:    mode,
+			Reuse:   options.Reuse,
+			Dialer:  transportDial,
+			Server:  server,
+		})
+		if err != nil {
+			return nil, err
+		}
+		dialer.client = v6Client
 	}
 	return dialer, nil
-}
-
-func (d *Dialer) newV6Record(ctx context.Context, network string) (*v6RecordConn, error) {
-	conn, err := d.next.DialContext(ctx, network, d.proxyAddress)
-	if err != nil {
-		return nil, err
-	}
-	return newV6RecordConn(conn, d.psk, d.v6Mode), nil
-}
-
-func (d *Dialer) newV4Record(ctx context.Context, network string) (*v4RecordConn, error) {
-	conn, err := d.next.DialContext(ctx, network, d.proxyAddress)
-	if err != nil {
-		return nil, err
-	}
-	return newV4RecordConn(conn, d.psk, d.options.Identity), nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {
@@ -82,101 +106,105 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 	if magic.Network != "tcp" && magic.Network != "udp" {
 		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, magic.Network)
 	}
-	tcpNetwork := netproxy.MagicNetwork{Network: "tcp", Mark: magic.Mark, Mptcp: magic.Mptcp}.Encode()
-	if d.options.Version == Version6 {
-		return d.dialV6(ctx, tcpNetwork, magic.Network, address)
+	destination, err := parseSocksaddr(address)
+	if err != nil {
+		return nil, fmt.Errorf("snell: invalid destination %q: %w", address, err)
 	}
-	if magic.Network == "udp" {
-		record, err := d.newV4Record(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		packetConn, err := newV4PacketConn(record, d.options.UserKey, address)
-		if err != nil {
-			_ = record.Close()
-			return nil, err
-		}
-		return packetConn, nil
+	tcpNetwork := netproxy.MagicNetwork{
+		Network:   "tcp",
+		Mark:      magic.Mark,
+		Mptcp:     magic.Mptcp,
+		IPVersion: magic.IPVersion,
+	}.Encode()
+	ctx = context.WithValue(ctx, magicNetworkContextKey{}, tcpNetwork)
+	if magic.Network == "tcp" {
+		return d.client.DialContext(ctx, destination)
 	}
-	destination, err := protocol.ParseMetadata(address)
+	rawConn, err := d.transportDial.DialContext(ctx, N.NetworkTCP, d.server)
 	if err != nil {
 		return nil, err
 	}
-	command := commandConnect
-	if d.options.Reuse {
-		command = commandConnectV2
-	}
-	request, err := makeTCPRequest(d.options.UserKey, destination, command)
+	packet, err := d.client.DialPacketConn(rawConn)
 	if err != nil {
+		_ = rawConn.Close()
 		return nil, err
 	}
-	if d.v4Pool == nil {
-		record, err := d.newV4Record(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = record.Write(request); err != nil {
-			_ = record.Close()
-			return nil, err
-		}
-		return &v4ClientConn{record: record, nonReusable: true}, nil
-	}
-	for attempts := 0; attempts < 2; attempts++ {
-		record, uses, err := d.v4Pool.get(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = record.Write(request); err != nil {
-			_ = record.Close()
-			continue
-		}
-		return &v4ClientConn{record: record, pool: d.v4Pool, uses: uses}, nil
-	}
-	return nil, fmt.Errorf("snell: failed to reuse connection")
+	return &packetConn{upstream: packet, target: destination}, nil
 }
 
-func (d *Dialer) dialV6(ctx context.Context, tcpNetwork, network, address string) (netproxy.Conn, error) {
-	if network == "udp" {
-		record, err := d.newV6Record(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		packetConn, err := newV6PacketConn(record, d.options.UserKey, address)
-		if err != nil {
-			_ = record.Close()
-			return nil, err
-		}
-		return packetConn, nil
-	}
-	destination, err := protocol.ParseMetadata(address)
-	if err != nil {
-		return nil, err
-	}
-	request, err := makeTCPRequest(d.options.UserKey, destination, commandConnectV2)
-	if err != nil {
-		return nil, err
-	}
-	if d.v6Pool == nil {
-		record, err := d.newV6Record(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = record.Write(request); err != nil {
-			_ = record.Close()
-			return nil, err
-		}
-		return &v6ClientConn{record: record, nonReusable: true}, nil
-	}
-	for attempts := 0; attempts < 2; attempts++ {
-		record, uses, err := d.v6Pool.get(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = record.Write(request); err != nil {
-			_ = record.Close()
-			continue
-		}
-		return &v6ClientConn{record: record, pool: d.v6Pool, uses: uses}, nil
-	}
-	return nil, fmt.Errorf("snell: failed to reuse version 6 connection")
+type magicNetworkContextKey struct{}
+
+type singDialer struct {
+	next         netproxy.Dialer
+	proxyAddress string
 }
+
+func (d *singDialer) DialContext(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
+	if encoded, ok := ctx.Value(magicNetworkContextKey{}).(string); ok {
+		network = encoded
+	}
+	conn, err := d.next.DialContext(ctx, network, d.proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	if netConn, ok := conn.(net.Conn); ok {
+		return netConn, nil
+	}
+	return &netproxy.FakeNetConn{Conn: conn}, nil
+}
+
+func (d *singDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: snell packet transport", netproxy.UnsupportedTunnelTypeError)
+}
+
+func parseSocksaddr(address string) (M.Socksaddr, error) {
+	metadata, err := protocol.ParseMetadata(address)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.ParseSocksaddrHostPort(metadata.Hostname, metadata.Port), nil
+}
+
+type packetConn struct {
+	upstream N.NetPacketConn
+	target   M.Socksaddr
+}
+
+func (c *packetConn) Read(p []byte) (int, error) {
+	n, _, err := c.ReadFrom(p)
+	return n, err
+}
+
+func (c *packetConn) Write(p []byte) (int, error) {
+	return c.upstream.WriteTo(p, c.target)
+}
+
+func (c *packetConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	n, address, err := c.upstream.ReadFrom(p)
+	if err != nil {
+		return 0, netip.AddrPort{}, err
+	}
+	if address == nil {
+		return 0, netip.AddrPort{}, fmt.Errorf("snell: missing UDP source")
+	}
+	source := M.SocksaddrFromNet(address).Unwrap()
+	if !source.Addr.IsValid() {
+		return 0, netip.AddrPort{}, fmt.Errorf("snell: invalid UDP source %q", address.String())
+	}
+	return n, source.AddrPort(), nil
+}
+
+func (c *packetConn) WriteTo(p []byte, address string) (int, error) {
+	destination, err := parseSocksaddr(strings.TrimSpace(address))
+	if err != nil {
+		return 0, fmt.Errorf("snell: invalid UDP destination %q: %w", address, err)
+	}
+	return c.upstream.WriteTo(p, destination)
+}
+
+func (c *packetConn) Close() error                       { return c.upstream.Close() }
+func (c *packetConn) SetDeadline(t time.Time) error      { return c.upstream.SetDeadline(t) }
+func (c *packetConn) SetReadDeadline(t time.Time) error  { return c.upstream.SetReadDeadline(t) }
+func (c *packetConn) SetWriteDeadline(t time.Time) error { return c.upstream.SetWriteDeadline(t) }
+
+var _ netproxy.PacketConn = (*packetConn)(nil)
