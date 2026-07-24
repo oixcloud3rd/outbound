@@ -3,6 +3,8 @@ package tls
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"github.com/daeuniverse/outbound/pkg/coalesce"
 	"net/url"
@@ -11,7 +13,6 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
-	utls "github.com/refraction-networking/utls"
 )
 
 // Tls is a base Tls struct
@@ -47,9 +48,20 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 
 	tlsImplentation := u.Scheme
 	utlsImitate := query.Get("utlsImitate")
-	if (tlsImplentation == "tls" || tlsImplentation == "") && option.TlsImplementation != "" {
+	if utlsImitate == "" {
+		utlsImitate = query.Get("client-fingerprint")
+	}
+	if tlsImplentation == "" && option.TlsImplementation != "" {
 		tlsImplentation = option.TlsImplementation
+	}
+	if tlsImplentation == "" {
+		tlsImplentation = "tls"
+	}
+	if utlsImitate == "" {
 		utlsImitate = option.UtlsImitate
+	}
+	if tlsImplentation == "utls" && utlsImitate == "" {
+		utlsImitate = "chrome_auto"
 	}
 	t := &Tls{
 		dialer:          nextDialer,
@@ -71,23 +83,33 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 	t.passthroughUdp, _ = strconv.ParseBool(u.Query().Get("passthroughUdp"))
 
 	// skipVerify
-	allowInsecure, _ := strconv.ParseBool(u.Query().Get("allowInsecure"))
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(u.Query().Get("allow_insecure"))
+	allowInsecure, explicit, err := optionalBool(query,
+		"skip-cert-verify", "allowInsecure", "allow_insecure", "allowinsecure", "skipVerify", "insecure")
+	if err != nil {
+		return nil, nil, err
 	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(u.Query().Get("allowinsecure"))
+	if !explicit {
+		allowInsecure = option.AllowInsecure
 	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(u.Query().Get("skipVerify"))
-	}
-	t.skipVerify = allowInsecure || option.AllowInsecure
+	t.skipVerify = allowInsecure
 	t.tlsConfig = &tls.Config{
 		ServerName:         t.serverName,
 		InsecureSkipVerify: t.skipVerify,
 	}
 	if len(query.Get("alpn")) > 0 {
 		t.tlsConfig.NextProtos = strings.Split(query.Get("alpn"), ",")
+	}
+	echConfig := query.Get("ech-config")
+	if echConfig == "" {
+		echConfig = query.Get("echConfig")
+	}
+	if echConfig != "" {
+		decoded, err := DecodeECHConfigList(echConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		t.tlsConfig.MinVersion = tls.VersionTLS13
+		t.tlsConfig.EncryptedClientHelloConfigList = decoded
 	}
 
 	if option.TlsFragment {
@@ -112,6 +134,48 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 		Protocol: tlsImplentation,
 		Link:     link,
 	}, nil
+}
+
+// DecodeECHConfigList decodes a standard padded or unpadded Base64 ECHConfigList
+// and validates its outer vector framing.
+func DecodeECHConfigList(encoded string) ([]byte, error) {
+	encoded = strings.TrimSpace(encoded)
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(encoded)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid ECHConfigList base64: %w", err)
+	}
+	if len(decoded) < 2 {
+		return nil, fmt.Errorf("invalid ECHConfigList: too short")
+	}
+	declared := int(binary.BigEndian.Uint16(decoded[:2]))
+	if declared == 0 || declared != len(decoded)-2 {
+		return nil, fmt.Errorf("invalid ECHConfigList length: declared %d, actual %d", declared, len(decoded)-2)
+	}
+	if declared < 4 {
+		return nil, fmt.Errorf("invalid ECHConfigList: empty config list")
+	}
+	return decoded, nil
+}
+
+func optionalBool(values url.Values, keys ...string) (bool, bool, error) {
+	for _, key := range keys {
+		list, ok := values[key]
+		if !ok || len(list) == 0 {
+			continue
+		}
+		if list[0] == "" {
+			return false, true, nil
+		}
+		value, err := strconv.ParseBool(list[0])
+		if err != nil {
+			return false, true, fmt.Errorf("invalid boolean %q for %s", list[0], key)
+		}
+		return value, true, nil
+	}
+	return false, false, nil
 }
 
 func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy.Conn, err error) {
@@ -156,7 +220,12 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 				return nil, err
 			}
 
-			tlsConn = utls.UClient(co, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
+			utlsConn, err := newUTLSClient(co, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
+			if err != nil {
+				_ = rc.Close()
+				return nil, err
+			}
+			tlsConn = utlsConn
 
 		default:
 			_ = rc.Close()
