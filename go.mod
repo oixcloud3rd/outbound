@@ -1,6 +1,6 @@
 module github.com/daeuniverse/outbound
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d
@@ -15,21 +15,24 @@ require (
 	github.com/mzz2017/disk-bloom v1.0.1
 	github.com/olicesx/quic-go v0.0.0-20260226044315-bb65418d151a
 	github.com/refraction-networking/utls v1.8.2
-	github.com/sagernet/sing v0.6.0
+	github.com/sagernet/sing v0.8.12-0.20260702081104-2ded2af32d3d
 	github.com/sagernet/sing-shadowtls v0.2.0
+	github.com/sagernet/sing-snell v0.0.0-20260724130459-8c230479c67c
 	github.com/samber/oops v1.19.4
 	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37
-	golang.org/x/crypto v0.36.0
+	golang.org/x/crypto v0.42.0
 	golang.org/x/exp v0.0.0-20250207012021-f9890c6ad9f3
-	golang.org/x/net v0.38.0
-	golang.org/x/sys v0.31.0
+	golang.org/x/net v0.43.0
+	golang.org/x/sys v0.41.0
 	google.golang.org/grpc v1.57.0
 	google.golang.org/protobuf v1.36.1
 	lukechampine.com/blake3 v1.4.1
 )
+
+require github.com/metacubex/blake3 v0.1.0 // indirect
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
@@ -52,12 +55,14 @@ require (
 	go.opentelemetry.io/otel v1.29.0 // indirect
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
-	golang.org/x/mod v0.23.0 // indirect
-	golang.org/x/sync v0.12.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
-	golang.org/x/tools v0.29.0 // indirect
+	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230807174057-1744710a1577 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260428161614-e0d255ff807c
+
+replace github.com/sagernet/sing-snell => github.com/oixcloud3rd/sing-snell v0.0.0-20260724130459-8c230479c67c
