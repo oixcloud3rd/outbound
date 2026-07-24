@@ -3,26 +3,68 @@ package tls
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 
 	utls "github.com/refraction-networking/utls"
 )
+
+func newUTLSClient(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
+	if len(config.NextProtos) == 0 {
+		return utls.UClient(conn, config, id), nil
+	}
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		// Randomized ClientHello profiles consume NextProtos directly and do not
+		// have a fixed preset to rewrite.
+		return utls.UClient(conn, config, id), nil
+	}
+	setUTLSSpecALPN(&spec, config.NextProtos)
+	client := utls.UClient(conn, config, utls.HelloCustom)
+	if err := client.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func setUTLSSpecALPN(spec *utls.ClientHelloSpec, protocols []string) {
+	protocols = append([]string(nil), protocols...)
+	extensions := make([]utls.TLSExtension, 0, len(spec.Extensions)+1)
+	foundALPN := false
+	for _, extension := range spec.Extensions {
+		switch typed := extension.(type) {
+		case *utls.ALPNExtension:
+			typed.AlpnProtocols = append([]string(nil), protocols...)
+			foundALPN = true
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			// ALPS settings from a browser preset may name a protocol that the
+			// explicit ALPN list removed (notably h2 for WebSocket transports).
+			continue
+		}
+		extensions = append(extensions, extension)
+	}
+	if !foundALPN {
+		extensions = append(extensions, &utls.ALPNExtension{AlpnProtocols: protocols})
+	}
+	spec.Extensions = extensions
+}
 
 func uTLSConfigFromTLSConfig(config *tls.Config) *utls.Config {
 	if config == nil {
 		return nil
 	}
 	uConfig := &utls.Config{
-		Rand:                   config.Rand,
-		Time:                   config.Time,
-		ServerName:             config.ServerName,
-		InsecureSkipVerify:     config.InsecureSkipVerify,
-		RootCAs:                config.RootCAs,
-		VerifyPeerCertificate:  config.VerifyPeerCertificate,
-		KeyLogWriter:           config.KeyLogWriter,
-		MinVersion:             config.MinVersion,
-		MaxVersion:             config.MaxVersion,
-		SessionTicketsDisabled: config.SessionTicketsDisabled,
-		Renegotiation:          utls.RenegotiationSupport(config.Renegotiation),
+		Rand:                           config.Rand,
+		Time:                           config.Time,
+		ServerName:                     config.ServerName,
+		InsecureSkipVerify:             config.InsecureSkipVerify,
+		RootCAs:                        config.RootCAs,
+		VerifyPeerCertificate:          config.VerifyPeerCertificate,
+		KeyLogWriter:                   config.KeyLogWriter,
+		MinVersion:                     config.MinVersion,
+		MaxVersion:                     config.MaxVersion,
+		SessionTicketsDisabled:         config.SessionTicketsDisabled,
+		Renegotiation:                  utls.RenegotiationSupport(config.Renegotiation),
+		EncryptedClientHelloConfigList: append([]byte(nil), config.EncryptedClientHelloConfigList...),
 	}
 	if len(config.NextProtos) > 0 {
 		uConfig.NextProtos = append([]string(nil), config.NextProtos...)
