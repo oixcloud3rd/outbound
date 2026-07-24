@@ -15,8 +15,9 @@ require (
 	github.com/mzz2017/disk-bloom v1.0.1
 	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
 	github.com/refraction-networking/utls v1.8.2
-	github.com/sagernet/sing v0.6.0
+	github.com/sagernet/sing v0.8.12-0.20260727003324-d096a164bc7f
 	github.com/sagernet/sing-shadowtls v0.2.0
+	github.com/sagernet/sing-snell v0.0.0-20260919065743-e4148a9db725
 	github.com/samber/oops v1.19.4
 	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
 	github.com/sirupsen/logrus v1.9.3
@@ -43,6 +44,7 @@ require (
 	github.com/google/pprof v0.0.0-20250208200701-d0013a598941 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+	github.com/metacubex/blake3 v0.1.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
@@ -61,3 +63,5 @@ require (
 )
 
 replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+
+replace github.com/sagernet/sing-snell => github.com/oixcloud3rd/sing-snell v0.0.0-20260919065743-e4148a9db725

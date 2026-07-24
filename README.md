@@ -7,6 +7,8 @@
 
 Snell v4, v5-compatible v4 wire, and Snell v6 are available through `snell://` links:
 
+The wire protocol, reuse pool, UDP framing, and HTTP/TLS obfuscation are provided by the pinned [oixcloud3rd/sing-snell](https://github.com/oixcloud3rd/sing-snell) fork; outbound supplies the `netproxy` adapter, link format, and ECH-TLS transport composition.
+
 ```text
 snell://<url-encoded-psk>@server.example:443?version=4&reuse=true#name
 snell://<url-encoded-psk>@server.example:443?version=6&mode=unshaped#name

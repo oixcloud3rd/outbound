@@ -1,8 +1,9 @@
 package snell
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -11,51 +12,39 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	singSnell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv5"
+	"github.com/sagernet/sing-snell/snellv6"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/require"
 )
 
+const testPSK = "test-password-v6"
+
 func TestDialerTCPRoundTrip(t *testing.T) {
 	t.Parallel()
-	tests := []ClientOptions{
+	for _, options := range []ClientOptions{
 		{Version: Version4},
 		{Version: Version5},
 		{Version: Version6, Mode: "default"},
 		{Version: Version6, Mode: "unshaped"},
 		{Version: Version6, Mode: "unsafe-raw"},
-	}
-	for _, options := range tests {
+	} {
+		options := options
 		t.Run(clientOptionsName(options), func(t *testing.T) {
-			base := &pipeDialer{serve: func(raw netproxy.Conn) {
-				record := testServerRecord(raw, []byte(testPSKFor(options.Version)), options)
-				command, host, port, err := readTCPRequest(record)
-				require.NoError(t, err)
-				if options.Version == Version6 {
-					require.Equal(t, commandConnectV2, command)
-				} else {
-					require.Equal(t, commandConnect, command)
-				}
-				require.Equal(t, "destination.example", host)
-				require.Equal(t, uint16(443), port)
-				payload := make([]byte, len("round-trip"))
-				_, err = io.ReadFull(record, payload)
-				require.NoError(t, err)
-				_, err = record.Write(append([]byte{replyTunnel}, payload...))
-				require.NoError(t, err)
-				require.NoError(t, testServerEOF(record))
-			}}
-			dialer, err := NewDialer(base, protocol.Header{
-				ProxyAddress: "proxy.example:443",
-				Password:     testPSKFor(options.Version),
-				Feature1:     options,
-			})
-			require.NoError(t, err)
+			t.Parallel()
+			dialer := newTestDialer(t, options)
 			conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
 			require.NoError(t, err)
-			_, err = conn.Write([]byte("round-trip"))
+			payload := []byte("round-trip")
+			_, err = conn.Write(payload)
 			require.NoError(t, err)
+			require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
 			response, err := io.ReadAll(conn)
 			require.NoError(t, err)
-			require.Equal(t, []byte("round-trip"), response)
+			require.Equal(t, payload, response)
 			require.NoError(t, conn.Close())
 		})
 	}
@@ -63,43 +52,28 @@ func TestDialerTCPRoundTrip(t *testing.T) {
 
 func TestDialerUDPRoundTrip(t *testing.T) {
 	t.Parallel()
-	tests := []ClientOptions{
+	for _, options := range []ClientOptions{
 		{Version: Version4},
+		{Version: Version5},
 		{Version: Version6, Mode: "default"},
 		{Version: Version6, Mode: "unshaped"},
 		{Version: Version6, Mode: "unsafe-raw"},
-	}
-	for _, options := range tests {
+	} {
+		options := options
 		t.Run(clientOptionsName(options), func(t *testing.T) {
-			base := &pipeDialer{serve: func(raw netproxy.Conn) {
-				record := testServerRecord(raw, []byte(testPSKFor(options.Version)), options)
-				require.NoError(t, readUDPRequest(record))
-				_, err := record.Write([]byte{replyTunnel})
-				require.NoError(t, err)
-				packet, err := testServerReadPacket(record)
-				require.NoError(t, err)
-				request, err := parseUDPRequestForTest(packet)
-				require.NoError(t, err)
-				response := []byte{4, 203, 0, 113, 9, 0x01, 0xbb}
-				response = append(response, request...)
-				require.NoError(t, testServerWritePacket(record, response))
-			}}
-			dialer, err := NewDialer(base, protocol.Header{
-				ProxyAddress: "proxy.example:443",
-				Password:     testPSKFor(options.Version),
-				Feature1:     options,
-			})
-			require.NoError(t, err)
-			conn, err := dialer.DialContext(context.Background(), "udp", "destination.example:443")
+			t.Parallel()
+			dialer := newTestDialer(t, options)
+			conn, err := dialer.DialContext(context.Background(), "udp", "203.0.113.9:443")
 			require.NoError(t, err)
 			packetConn := conn.(netproxy.PacketConn)
-			_, err = packetConn.Write([]byte("datagram"))
+			payload := []byte("datagram")
+			_, err = packetConn.Write(payload)
 			require.NoError(t, err)
 			buffer := make([]byte, 64)
 			n, source, err := packetConn.ReadFrom(buffer)
 			require.NoError(t, err)
 			require.Equal(t, netip.MustParseAddrPort("203.0.113.9:443"), source)
-			require.Equal(t, []byte("datagram"), buffer[:n])
+			require.Equal(t, payload, buffer[:n])
 			require.NoError(t, packetConn.Close())
 		})
 	}
@@ -109,43 +83,24 @@ func TestDialerConnectionReuse(t *testing.T) {
 	t.Parallel()
 	for _, options := range []ClientOptions{
 		{Version: Version4, Reuse: true},
+		{Version: Version5, Reuse: true},
 		{Version: Version6, Mode: "unshaped", Reuse: true},
 	} {
+		options := options
 		t.Run(clientOptionsName(options), func(t *testing.T) {
+			t.Parallel()
 			var physicalConnections atomic.Int32
-			base := &pipeDialer{serve: func(raw netproxy.Conn) {
-				physicalConnections.Add(1)
-				record := testServerRecord(raw, []byte(testPSKFor(options.Version)), options)
-				for requestIndex := 0; requestIndex < 2; requestIndex++ {
-					command, _, _, err := readTCPRequest(record)
-					require.NoError(t, err)
-					require.Equal(t, commandConnectV2, command)
-					payload := make([]byte, len("reuse"))
-					_, err = io.ReadFull(record, payload)
-					require.NoError(t, err)
-					one := make([]byte, 1)
-					_, err = record.Read(one)
-					require.ErrorIs(t, err, io.EOF)
-					_, err = record.Write(append([]byte{replyTunnel}, payload...))
-					require.NoError(t, err)
-					require.NoError(t, testServerEOF(record))
-				}
-			}}
-			dialer, err := NewDialer(base, protocol.Header{
-				ProxyAddress: "proxy.example:443",
-				Password:     testPSKFor(options.Version),
-				Feature1:     options,
-			})
-			require.NoError(t, err)
+			dialer := newTestDialerWithCounter(t, options, &physicalConnections)
 			for requestIndex := 0; requestIndex < 2; requestIndex++ {
 				conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
 				require.NoError(t, err)
-				_, err = conn.Write([]byte("reuse"))
+				payload := []byte("reuse")
+				_, err = conn.Write(payload)
 				require.NoError(t, err)
 				require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
 				response, err := io.ReadAll(conn)
 				require.NoError(t, err)
-				require.Equal(t, []byte("reuse"), response)
+				require.Equal(t, payload, response)
 				require.NoError(t, conn.Close())
 			}
 			require.Equal(t, int32(1), physicalConnections.Load())
@@ -153,106 +108,248 @@ func TestDialerConnectionReuse(t *testing.T) {
 	}
 }
 
-type testRecord interface {
-	netproxy.Conn
-	readPacket() ([]byte, error)
-	writePacket([]byte) error
-	writeEOF() error
+func TestDialerV4Obfs(t *testing.T) {
+	t.Parallel()
+	for _, obfs := range []string{"http", "tls"} {
+		obfs := obfs
+		t.Run(obfs, func(t *testing.T) {
+			t.Parallel()
+			options := ClientOptions{Version: Version5, Obfs: obfs, ObfsHost: "obfs.example"}
+			dialer := newTestDialer(t, options)
+			conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
+			require.NoError(t, err)
+			_, err = conn.Write([]byte(obfs))
+			require.NoError(t, err)
+			require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
+			response, err := io.ReadAll(conn)
+			require.NoError(t, err)
+			require.Equal(t, []byte(obfs), response)
+			require.NoError(t, conn.Close())
+		})
+	}
 }
 
-func testServerRecord(raw netproxy.Conn, psk []byte, options ClientOptions) testRecord {
+func TestDialerUserKey(t *testing.T) {
+	t.Parallel()
+	for _, options := range []ClientOptions{
+		{Version: Version5, UserKey: "user-key"},
+		{Version: Version6, Mode: "default", UserKey: "user-key"},
+	} {
+		options := options
+		t.Run(clientOptionsName(options), func(t *testing.T) {
+			t.Parallel()
+			dialer := newTestDialer(t, options)
+			conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
+			require.NoError(t, err)
+			_, err = conn.Write([]byte("authenticated"))
+			require.NoError(t, err)
+			require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
+			response, err := io.ReadAll(conn)
+			require.NoError(t, err)
+			require.Equal(t, []byte("authenticated"), response)
+			require.NoError(t, conn.Close())
+		})
+	}
+}
+
+func TestDialerPreservesMagicNetwork(t *testing.T) {
+	t.Parallel()
+	options := ClientOptions{Version: Version5}
+	networks := make(chan string, 1)
+	base := &serviceDialer{service: newTestService(t, options), networks: networks}
+	dialer, err := NewDialer(base, protocol.Header{
+		ProxyAddress: "proxy.example:443",
+		Password:     testPSK,
+		Feature1:     options,
+	})
+	require.NoError(t, err)
+	want := netproxy.MagicNetwork{Network: "tcp", Mark: 123, Mptcp: true, IPVersion: "4"}
+	conn, err := dialer.DialContext(context.Background(), want.Encode(), "destination.example:443")
+	require.NoError(t, err)
+	got, err := netproxy.ParseMagicNetwork(<-networks)
+	require.NoError(t, err)
+	require.Equal(t, &want, got)
+	require.NoError(t, conn.Close())
+}
+
+func TestDialerExplicitIdentity(t *testing.T) {
+	t.Parallel()
+	prefixes := make(chan []byte, 1)
+	base := &identityCaptureDialer{prefixes: prefixes}
+	dialer, err := NewDialer(base, protocol.Header{
+		ProxyAddress: "proxy.example:443",
+		Password:     testPSK,
+		Feature1: ClientOptions{
+			Version:  Version5,
+			Identity: true,
+		},
+	})
+	require.NoError(t, err)
+	conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
+	require.NoError(t, err)
+	prefix := <-prefixes
+	require.Equal(t, "DLSNID01", string(prefix[singSnell.SaltLen:singSnell.SaltLen+8]))
+	require.Equal(t, singSnell.IdentityHeaderFromPSK([]byte(testPSK)), prefix[singSnell.SaltLen+8:])
+	require.NoError(t, conn.Close())
+}
+
+func newTestDialer(t *testing.T, options ClientOptions) netproxy.Dialer {
+	t.Helper()
+	return newTestDialerWithCounter(t, options, nil)
+}
+
+func newTestDialerWithCounter(t *testing.T, options ClientOptions, counter *atomic.Int32) netproxy.Dialer {
+	t.Helper()
+	service := newTestService(t, options)
+	base := &serviceDialer{service: service, connections: counter}
+	dialer, err := NewDialer(base, protocol.Header{
+		ProxyAddress: "proxy.example:443",
+		Password:     testPSK,
+		Feature1:     options,
+	})
+	require.NoError(t, err)
+	return dialer
+}
+
+func newTestService(t *testing.T, options ClientOptions) singSnell.Service {
+	t.Helper()
+	handler := echoHandler{}
 	if options.Version == Version6 {
-		mode, _ := parseV6Mode(options.Mode)
-		return newV6RecordConn(raw, psk, mode)
-	}
-	return newV4RecordConn(raw, psk, false)
-}
-
-func testServerEOF(record testRecord) error                  { return record.writeEOF() }
-func testServerReadPacket(record testRecord) ([]byte, error) { return record.readPacket() }
-func testServerWritePacket(record testRecord, packet []byte) error {
-	return record.writePacket(packet)
-}
-
-func readTCPRequest(r io.Reader) (byte, string, uint16, error) {
-	var prefix [3]byte
-	if _, err := io.ReadFull(r, prefix[:]); err != nil {
-		return 0, "", 0, err
-	}
-	if prefix[0] != requestVersion || prefix[1] != commandConnect && prefix[1] != commandConnectV2 {
-		return 0, "", 0, ErrBadRecord
-	}
-	if _, err := io.CopyN(io.Discard, r, int64(prefix[2])); err != nil {
-		return 0, "", 0, err
-	}
-	var hostLen [1]byte
-	if _, err := io.ReadFull(r, hostLen[:]); err != nil {
-		return 0, "", 0, err
-	}
-	host := make([]byte, int(hostLen[0]))
-	if _, err := io.ReadFull(r, host); err != nil {
-		return 0, "", 0, err
-	}
-	var port [2]byte
-	if _, err := io.ReadFull(r, port[:]); err != nil {
-		return 0, "", 0, err
-	}
-	return prefix[1], string(host), binary.BigEndian.Uint16(port[:]), nil
-}
-
-func readUDPRequest(r io.Reader) error {
-	var prefix [3]byte
-	if _, err := io.ReadFull(r, prefix[:]); err != nil {
-		return err
-	}
-	if prefix[0] != requestVersion || prefix[1] != commandUDP {
-		return ErrBadRecord
-	}
-	_, err := io.CopyN(io.Discard, r, int64(prefix[2]))
-	return err
-}
-
-func parseUDPRequestForTest(packet []byte) ([]byte, error) {
-	if len(packet) < 2 || packet[0] != udpForward {
-		return nil, ErrBadRecord
-	}
-	offset := 2 + int(packet[1]) + 2
-	if packet[1] == 0 {
-		if len(packet) < 3 {
-			return nil, ErrBadRecord
+		mode, err := snellv6.ParseMode(options.Mode)
+		require.NoError(t, err)
+		serverOptions := snellv6.ServerOptions{
+			PSK:     []byte(testPSK),
+			Mode:    mode,
+			Handler: handler,
 		}
-		if packet[2] == 4 {
-			offset = 3 + net.IPv4len + 2
-		} else {
-			offset = 3 + net.IPv6len + 2
+		if options.UserKey != "" {
+			service, err := snellv6.NewMultiService[string](serverOptions)
+			require.NoError(t, err)
+			require.NoError(t, service.UpdateUsers([]string{"user"}, [][]byte{[]byte(options.UserKey)}))
+			return service
 		}
+		service, err := snellv6.NewService(serverOptions)
+		require.NoError(t, err)
+		return service
 	}
-	if len(packet) < offset {
-		return nil, ErrBadRecord
+	obfsMode, err := singSnell.ParseObfsMode(options.Obfs)
+	require.NoError(t, err)
+	serviceOptions := snellv5.ServiceOptions{
+		PSK:      []byte(testPSK),
+		ObfsMode: obfsMode,
+		Handler:  handler,
 	}
-	return packet[offset:], nil
+	if options.UserKey != "" {
+		service, err := snellv5.NewMultiService[string](serviceOptions)
+		require.NoError(t, err)
+		require.NoError(t, service.UpdateUsers([]string{"user"}, [][]byte{[]byte(options.UserKey)}))
+		return service
+	}
+	service, err := snellv5.NewService(serviceOptions)
+	require.NoError(t, err)
+	return service
+}
+
+type serviceDialer struct {
+	service     singSnell.Service
+	connections *atomic.Int32
+	networks    chan string
+}
+
+type identityCaptureDialer struct {
+	prefixes chan []byte
+}
+
+func (d *identityCaptureDialer) DialContext(context.Context, string, string) (netproxy.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		prefix := make([]byte, singSnell.SaltLen+8+singSnell.IdentityHeaderLength)
+		_, err := io.ReadFull(server, prefix)
+		if err == nil {
+			d.prefixes <- prefix
+		}
+		_, _ = io.Copy(io.Discard, server)
+		_ = server.Close()
+	}()
+	return client, nil
+}
+
+func (d *serviceDialer) DialContext(_ context.Context, network, _ string) (netproxy.Conn, error) {
+	client, server := net.Pipe()
+	if d.connections != nil {
+		d.connections.Add(1)
+	}
+	if d.networks != nil {
+		d.networks <- network
+	}
+	go func() {
+		err := d.service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+		if err != nil {
+			_ = server.Close()
+		}
+	}()
+	return client, nil
+}
+
+type echoHandler struct{}
+
+func (echoHandler) NewConnectionEx(_ context.Context, conn net.Conn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		payload, err := io.ReadAll(conn)
+		if err == nil {
+			_, err = io.Copy(conn, bytes.NewReader(payload))
+		}
+		closeWriteErr := N.CloseWrite(conn)
+		if err == nil {
+			err = closeWriteErr
+		}
+		closeErr := conn.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if onClose != nil {
+			onClose(err)
+		}
+	}()
+}
+
+func (echoHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		var closeErr error
+		defer func() {
+			if err := conn.Close(); closeErr == nil {
+				closeErr = err
+			}
+			if onClose != nil {
+				onClose(closeErr)
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				closeErr = ctx.Err()
+				return
+			default:
+			}
+			buffer := buf.NewSize(64 * 1024)
+			buffer.Resize(2048, 0)
+			destination, err := conn.ReadPacket(buffer)
+			if err != nil {
+				buffer.Release()
+				closeErr = err
+				return
+			}
+			if err = conn.WritePacket(buffer, destination); err != nil {
+				closeErr = err
+				return
+			}
+		}
+	}()
 }
 
 func clientOptionsName(options ClientOptions) string {
 	if options.Version == Version6 {
 		return "v6-" + options.Mode
 	}
-	return "v" + string(rune('0'+options.Version))
-}
-
-func testPSKFor(version int) string {
-	if version == Version6 {
-		return "test-password-v6"
-	}
-	return "test-password"
-}
-
-type pipeDialer struct {
-	serve func(netproxy.Conn)
-}
-
-func (d *pipeDialer) DialContext(context.Context, string, string) (netproxy.Conn, error) {
-	client, server := net.Pipe()
-	go d.serve(server)
-	return client, nil
+	return fmt.Sprintf("v%d", options.Version)
 }

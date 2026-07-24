@@ -13,7 +13,6 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	protocolSnell "github.com/daeuniverse/outbound/protocol/snell"
-	"github.com/daeuniverse/outbound/transport/simpleobfs"
 	transportTLS "github.com/daeuniverse/outbound/transport/tls"
 	"github.com/daeuniverse/outbound/transport/ws"
 )
@@ -190,19 +189,7 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 	address := net.JoinHostPort(s.Server, strconv.Itoa(s.Port))
 	current := nextDialer
 	var err error
-	switch s.Obfs {
-	case "http", "tls":
-		host := s.ObfsHost
-		if host == "" {
-			host = "bing.com"
-		}
-		obfsURL := &url.URL{Scheme: "simpleobfs", Host: address}
-		query := obfsURL.Query()
-		query.Set("obfs", s.Obfs)
-		query.Set("host", host)
-		obfsURL.RawQuery = query.Encode()
-		current, _, err = simpleobfs.NewSimpleObfs(option, current, obfsURL.String())
-	case "ech-tls":
+	if s.Obfs == "ech-tls" {
 		tlsImplementation := s.TLSImplementation
 		if tlsImplementation == "" {
 			tlsImplementation = option.TlsImplementation
@@ -251,6 +238,10 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 	if err != nil {
 		return nil, nil, err
 	}
+	protocolObfs := s.Obfs
+	if protocolObfs == "ech-tls" {
+		protocolObfs = "none"
+	}
 	current, err = protocol.NewDialer("snell", current, protocol.Header{
 		ProxyAddress: address,
 		Password:     s.PSK,
@@ -261,6 +252,8 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 			Reuse:    s.Reuse,
 			Identity: s.Identity,
 			Mode:     s.Mode,
+			Obfs:     protocolObfs,
+			ObfsHost: s.ObfsHost,
 		},
 	})
 	if err != nil {
