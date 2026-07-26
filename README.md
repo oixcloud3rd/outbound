@@ -16,10 +16,15 @@ snell://<url-encoded-psk>@server.example:443?version=6&mode=unshaped#name
 
 v4/v5 support `userkey`, connection reuse, explicitly enabled `identity=true`, and `http`, `tls`, or `ech-tls` obfuscation. Identity is disabled by default, including for ECH-TLS. v6 supports `default`, `unshaped`, and `unsafe-raw` modes; its PSK must contain 12–255 bytes and it cannot be combined with obfuscation or identity.
 
-ECH-TLS uses Snell v4 wire over WebSocket over TLS 1.3 with ECH:
+ECH-TLS carries the Snell v4 wire directly over TLS 1.3 with ECH. The TLS
+client always offers `h2` as its only ALPN protocol; no HTTP/2 or WebSocket
+framing is added after the handshake:
 
 ```text
-snell://psk@server.example:443?version=5&reuse=true&obfs=ech-tls&sni=origin.example&ws-host=tunnel.example&path=%2Fsnell&ech-config=<url-encoded-base64>#name
+snell://psk@server.example:443?version=5&reuse=true&obfs=ech-tls&sni=origin.example&ech-config=<url-encoded-base64>#name
 ```
 
-`ech-config` is a padded or unpadded standard-Base64 ECHConfigList. The WebSocket path is required. `skip-cert-verify`, `tls-implementation`, and `client-fingerprint` are optional; standard TLS remains the default.
+`ech-config` is a padded or unpadded standard-Base64 ECHConfigList.
+`skip-cert-verify`, `tls-implementation`, and `client-fingerprint` are optional;
+standard TLS remains the default. Legacy `path`, `obfs-uri`, and `ws-host`
+query parameters are accepted but ignored and omitted from canonical exports.

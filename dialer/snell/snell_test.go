@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/daeuniverse/outbound/dialer"
 	protocolSnell "github.com/daeuniverse/outbound/protocol/snell"
 	"github.com/stretchr/testify/require"
 )
@@ -15,7 +16,7 @@ func TestParseAndExportURL(t *testing.T) {
 		"snell://password@example.com:443?version=4#plain",
 		"snell://p%40ss@[2001:db8::1]:8443?version=5&reuse=true&identity=true&obfs=http&obfs-host=cdn.example#v5",
 		"snell://123456789012@example.com:443?version=6&mode=unshaped&userkey=user#v6",
-		"snell://password@example.com:443?version=4&obfs=ech-tls&sni=origin.example&ws-host=ws.example&path=%2Fsnell&ech-config=AAQ%2BDAAA#ech",
+		"snell://password@example.com:443?version=4&obfs=ech-tls&sni=origin.example&ech-config=AAQ%2BDAAA#ech",
 	}
 	for _, link := range tests {
 		configuration, err := ParseURL(link)
@@ -29,7 +30,7 @@ func TestParseAndExportURL(t *testing.T) {
 
 func TestDefaultsAndAliases(t *testing.T) {
 	t.Parallel()
-	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&path=/ws&echConfig=AAQ%2BDAAA&allowInsecure=true&tlsImplementation=utls&utlsImitate=chrome_auto")
+	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&echConfig=AAQ%2BDAAA&allowInsecure=true&tlsImplementation=utls&utlsImitate=chrome_auto")
 	require.NoError(t, err)
 	require.Equal(t, protocolSnell.Version4, configuration.Version)
 	require.False(t, configuration.Identity)
@@ -41,7 +42,7 @@ func TestDefaultsAndAliases(t *testing.T) {
 
 func TestIdentityRequiresExplicitOption(t *testing.T) {
 	t.Parallel()
-	base := "snell://password@example.com:443?obfs=ech-tls&path=/ws&ech-config=AAQ%2BDAAA"
+	base := "snell://password@example.com:443?obfs=ech-tls&ech-config=AAQ%2BDAAA"
 	configuration, err := ParseURL(base)
 	require.NoError(t, err)
 	require.False(t, configuration.Identity)
@@ -62,7 +63,7 @@ func TestRejectV6TransportOptions(t *testing.T) {
 
 func TestExportEscapesECHConfig(t *testing.T) {
 	t.Parallel()
-	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&path=/ws&ech-config=AAQ%2BDAAA")
+	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&ech-config=AAQ%2BDAAA")
 	require.NoError(t, err)
 	u, err := url.Parse(configuration.ExportToURL())
 	require.NoError(t, err)
@@ -72,22 +73,40 @@ func TestExportEscapesECHConfig(t *testing.T) {
 func TestECHConfigIsValidatedAndNormalized(t *testing.T) {
 	t.Parallel()
 	raw := []byte{0, 5, 0xfe, 0x0d, 0, 1, 0}
-	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&path=/ws&ech-config=" +
+	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&ech-config=" +
 		url.QueryEscape(base64.RawStdEncoding.EncodeToString(raw)))
 	require.NoError(t, err)
 	require.Equal(t, base64.StdEncoding.EncodeToString(raw), configuration.ECHConfig)
 
-	_, err = ParseURL("snell://password@example.com:443?obfs=ech-tls&path=/ws&ech-config=broken")
+	_, err = ParseURL("snell://password@example.com:443?obfs=ech-tls&ech-config=broken")
 	require.ErrorContains(t, err, "ECHConfigList")
 }
 
 func TestExplicitFalseTLSOptionSurvivesExport(t *testing.T) {
 	t.Parallel()
-	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&path=/ws&ech-config=AAQ%2BDAAA&skip-cert-verify=false")
+	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&ech-config=AAQ%2BDAAA&skip-cert-verify=false")
 	require.NoError(t, err)
 	require.True(t, configuration.SkipVerifyExplicit)
 	require.False(t, configuration.SkipCertVerify)
 	require.Contains(t, configuration.ExportToURL(), "skip-cert-verify=false")
+}
+
+func TestECHTLSUsesRawTLSAndIgnoresLegacyWebSocketOptions(t *testing.T) {
+	t.Parallel()
+	configuration, err := ParseURL("snell://password@example.com:443?obfs=ech-tls&sni=origin.example&ws-host=ws.example&path=/ws&obfs-uri=/legacy&ech-config=AAQ%2BDAAA")
+	require.NoError(t, err)
+	require.Empty(t, configuration.WSHost)
+	require.Empty(t, configuration.Path)
+
+	exported, err := url.Parse(configuration.ExportToURL())
+	require.NoError(t, err)
+	require.Empty(t, exported.Query().Get("ws-host"))
+	require.Empty(t, exported.Query().Get("path"))
+	require.Empty(t, exported.Query().Get("obfs-uri"))
+
+	tlsURL := configuration.echTLSURL(&dialer.ExtraOption{}, "example.com:443")
+	require.Equal(t, []string{snellECHTLSALPN}, tlsURL.Query()["alpn"])
+	require.Equal(t, "origin.example", tlsURL.Query().Get("sni"))
 }
 
 func TestRejectV6ECHTLSFields(t *testing.T) {
