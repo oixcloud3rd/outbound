@@ -14,8 +14,9 @@ import (
 	"github.com/daeuniverse/outbound/protocol"
 	protocolSnell "github.com/daeuniverse/outbound/protocol/snell"
 	transportTLS "github.com/daeuniverse/outbound/transport/tls"
-	"github.com/daeuniverse/outbound/transport/ws"
 )
+
+const snellECHTLSALPN = "h2"
 
 func init() {
 	dialer.FromLinkRegister("snell", NewSnell)
@@ -35,13 +36,16 @@ type Snell struct {
 	Identity           bool
 	IdentityExplicit   bool
 	SNI                string
-	WSHost             string
-	Path               string
 	ECHConfig          string
 	SkipCertVerify     bool
 	SkipVerifyExplicit bool
 	TLSImplementation  string
 	ClientFingerprint  string
+
+	// Deprecated: raw ECH-TLS does not use a WebSocket Host header.
+	WSHost string
+	// Deprecated: raw ECH-TLS does not use a WebSocket path.
+	Path string
 }
 
 func NewSnell(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -95,7 +99,6 @@ func ParseURL(link string) (*Snell, error) {
 	}
 	tlsImplementation, _ := firstQuery(query, "tls-implementation", "tlsImplementation")
 	clientFingerprint, _ := firstQuery(query, "client-fingerprint", "utlsImitate", "fp")
-	path, _ := firstQuery(query, "path", "obfs-uri")
 	configuration := &Snell{
 		Name:               u.Fragment,
 		Server:             u.Hostname(),
@@ -110,8 +113,6 @@ func ParseURL(link string) (*Snell, error) {
 		Identity:           identity,
 		IdentityExplicit:   identityExplicit,
 		SNI:                query.Get("sni"),
-		WSHost:             query.Get("ws-host"),
-		Path:               path,
 		ECHConfig:          firstValue(query, "ech-config", "echConfig"),
 		SkipCertVerify:     skipVerify,
 		SkipVerifyExplicit: skipVerifyExplicit,
@@ -153,7 +154,7 @@ func (s *Snell) validate() error {
 			return fmt.Errorf("snell: version 6 PSK length must be between 12 and 255 bytes")
 		}
 		if s.Obfs != "none" || s.ObfsHost != "" || s.Identity || s.IdentityExplicit ||
-			s.ECHConfig != "" || s.SNI != "" || s.WSHost != "" || s.Path != "" ||
+			s.ECHConfig != "" || s.SNI != "" ||
 			s.SkipVerifyExplicit || s.TLSImplementation != "" || s.ClientFingerprint != "" {
 			return fmt.Errorf("snell: version 6 cannot be combined with obfs, identity, or ECH-TLS")
 		}
@@ -166,16 +167,13 @@ func (s *Snell) validate() error {
 		return fmt.Errorf("snell: unsupported version %d", s.Version)
 	}
 	if s.Obfs == "ech-tls" {
-		if s.Path == "" || !strings.HasPrefix(s.Path, "/") {
-			return fmt.Errorf("snell: ECH-TLS requires a WebSocket path beginning with '/'")
-		}
 		if s.ECHConfig == "" {
 			return fmt.Errorf("snell: ECH-TLS requires ech-config")
 		}
 		if s.TLSImplementation != "" && s.TLSImplementation != "tls" && s.TLSImplementation != "utls" {
 			return fmt.Errorf("snell: unsupported TLS implementation %q", s.TLSImplementation)
 		}
-	} else if s.ECHConfig != "" || s.SNI != "" || s.WSHost != "" || s.Path != "" ||
+	} else if s.ECHConfig != "" || s.SNI != "" ||
 		s.SkipVerifyExplicit || s.TLSImplementation != "" || s.ClientFingerprint != "" {
 		return fmt.Errorf("snell: ECH-TLS parameters require obfs=ech-tls")
 	}
@@ -190,50 +188,8 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 	current := nextDialer
 	var err error
 	if s.Obfs == "ech-tls" {
-		tlsImplementation := s.TLSImplementation
-		if tlsImplementation == "" {
-			tlsImplementation = option.TlsImplementation
-		}
-		if tlsImplementation == "" {
-			tlsImplementation = "tls"
-		}
-		sni := s.SNI
-		if sni == "" {
-			sni = s.ObfsHost
-		}
-		if sni == "" {
-			sni = s.Server
-		}
-		fingerprint := s.ClientFingerprint
-		if fingerprint == "" {
-			fingerprint = option.UtlsImitate
-		}
-		tlsURL := &url.URL{Scheme: tlsImplementation, Host: address}
-		tlsQuery := tlsURL.Query()
-		tlsQuery.Set("sni", sni)
-		tlsQuery.Set("ech-config", s.ECHConfig)
-		tlsQuery.Set("alpn", "http/1.1")
-		skipCertVerify := option.AllowInsecure
-		if s.SkipVerifyExplicit {
-			skipCertVerify = s.SkipCertVerify
-		}
-		tlsQuery.Set("allowInsecure", common.BoolToString(skipCertVerify))
-		if fingerprint != "" {
-			tlsQuery.Set("utlsImitate", fingerprint)
-		}
-		tlsURL.RawQuery = tlsQuery.Encode()
+		tlsURL := s.echTLSURL(option, address)
 		current, _, err = transportTLS.NewTls(option, current, tlsURL.String())
-		if err == nil {
-			wsHost := s.WSHost
-			if wsHost == "" {
-				wsHost = sni
-			}
-			wsURL := &url.URL{Scheme: "ws", Host: address, Path: s.Path}
-			wsQuery := wsURL.Query()
-			wsQuery.Set("host", wsHost)
-			wsURL.RawQuery = wsQuery.Encode()
-			current, _, err = ws.NewWs(option, current, wsURL.String())
-		}
 	}
 	if err != nil {
 		return nil, nil, err
@@ -293,13 +249,9 @@ func (s *Snell) ExportToURL() string {
 		}
 	}
 	if s.Obfs == "ech-tls" {
-		query.Set("path", s.Path)
 		query.Set("ech-config", s.ECHConfig)
 		if s.SNI != "" {
 			query.Set("sni", s.SNI)
-		}
-		if s.WSHost != "" {
-			query.Set("ws-host", s.WSHost)
 		}
 		if s.SkipVerifyExplicit {
 			query.Set("skip-cert-verify", strconv.FormatBool(s.SkipCertVerify))
@@ -313,6 +265,42 @@ func (s *Snell) ExportToURL() string {
 	}
 	u.RawQuery = query.Encode()
 	return u.String()
+}
+
+func (s *Snell) echTLSURL(option *dialer.ExtraOption, address string) *url.URL {
+	tlsImplementation := s.TLSImplementation
+	if tlsImplementation == "" {
+		tlsImplementation = option.TlsImplementation
+	}
+	if tlsImplementation == "" {
+		tlsImplementation = "tls"
+	}
+	sni := s.SNI
+	if sni == "" {
+		sni = s.ObfsHost
+	}
+	if sni == "" {
+		sni = s.Server
+	}
+	fingerprint := s.ClientFingerprint
+	if fingerprint == "" {
+		fingerprint = option.UtlsImitate
+	}
+	skipCertVerify := option.AllowInsecure
+	if s.SkipVerifyExplicit {
+		skipCertVerify = s.SkipCertVerify
+	}
+	tlsURL := &url.URL{Scheme: tlsImplementation, Host: address}
+	tlsQuery := tlsURL.Query()
+	tlsQuery.Set("sni", sni)
+	tlsQuery.Set("ech-config", s.ECHConfig)
+	tlsQuery.Set("alpn", snellECHTLSALPN)
+	tlsQuery.Set("allowInsecure", common.BoolToString(skipCertVerify))
+	if fingerprint != "" {
+		tlsQuery.Set("utlsImitate", fingerprint)
+	}
+	tlsURL.RawQuery = tlsQuery.Encode()
+	return tlsURL
 }
 
 func firstQuery(values url.Values, keys ...string) (string, bool) {
