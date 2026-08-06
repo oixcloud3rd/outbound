@@ -56,8 +56,8 @@ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9G
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/mzz2017/disk-bloom v1.0.1 h1:rEF9MiXd9qMW3ibRpqcerLXULoTgRlM21yqqJl1B90M=
 github.com/mzz2017/disk-bloom v1.0.1/go.mod h1:JLHETtUu44Z6iBmsqzkOtFlRvXSlKnxjwiBRDapizDI=
-github.com/oixcloud3rd/sing-snell v0.0.0-20260806050542-54ec3d09fd26 h1:t4BWVEbzls0k0yAaRXd7w1514cUsXi1XOEaUi2QqGfo=
-github.com/oixcloud3rd/sing-snell v0.0.0-20260806050542-54ec3d09fd26/go.mod h1:wdPnrzkEbbxIGryTzQd2tU988Le/CwkhUgOBqzTX1yw=
+github.com/oixcloud3rd/sing-snell v0.0.0-20260806061941-924f2fe9981d h1:WrLx6ds1IUWGk0RkttslyWk9Al4cQiNHwMRnZ8w5hLc=
+github.com/oixcloud3rd/sing-snell v0.0.0-20260806061941-924f2fe9981d/go.mod h1:wdPnrzkEbbxIGryTzQd2tU988Le/CwkhUgOBqzTX1yw=
 github.com/oklog/ulid/v2 v2.1.1 h1:suPZ4ARWLOJLegGFiZZ1dFAkqzhMjL3J1TzI+5wHz8s=
 github.com/oklog/ulid/v2 v2.1.1/go.mod h1:rcEKHmBBKfef9DhnvX7y1HZBYxjXb0cP5ExxNsTT1QQ=
 github.com/olicesx/quic-go v0.0.0-20260428161614-e0d255ff807c h1:XvI7EiHeJiW+bzgvXHpVmObpesgmKyFoIO/GiewctQk=

@@ -17,7 +17,7 @@ require (
 	github.com/olicesx/quic-go v0.0.0-20260226044315-bb65418d151a
 	github.com/sagernet/sing v0.8.12-0.20260727003324-d096a164bc7f
 	github.com/sagernet/sing-shadowtls v0.2.0
-	github.com/sagernet/sing-snell v0.0.0-20260806050542-54ec3d09fd26
+	github.com/sagernet/sing-snell v0.0.0-20260806061941-924f2fe9981d
 	github.com/samber/oops v1.19.4
 	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
 	github.com/sirupsen/logrus v1.9.3
@@ -65,4 +65,4 @@ require (
 
 replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260428161614-e0d255ff807c
 
-replace github.com/sagernet/sing-snell => github.com/oixcloud3rd/sing-snell v0.0.0-20260806050542-54ec3d09fd26
+replace github.com/sagernet/sing-snell => github.com/oixcloud3rd/sing-snell v0.0.0-20260806061941-924f2fe9981d

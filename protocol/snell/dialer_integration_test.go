@@ -308,7 +308,7 @@ func newTestService(t *testing.T, options ClientOptions) singSnell.Service {
 	require.NoError(t, err)
 	serviceOptions := snellv5.ServiceOptions{
 		PSK:      []byte(testPSK),
-		Identity: singSnell.IdentityVersion(options.Identity),
+		Identity: options.Identity != singSnell.IdentityDisabled,
 		ObfsMode: obfsMode,
 		Handler:  handler,
 	}
