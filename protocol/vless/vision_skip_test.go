@@ -8,7 +8,7 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/vless/vision"
 	outboundtls "github.com/daeuniverse/outbound/transport/tls"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 // TestVisionNewConnAcceptsSkippedTLSUnderlay is the production XTLS path

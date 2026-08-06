@@ -37,7 +37,7 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/logger"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 )
@@ -252,8 +252,7 @@ func dropHybridKeyShare(uConn *utls.UConn) {
 }
 
 // realityECDHEKey returns the TLS 1.3 ECDHE private key used by REALITY.
-// Newer uTLS versions populate KeyShareKeys and may leave the deprecated
-// EcdheKey field unset, so keep compatibility with both layouts.
+// Current uTLS versions expose the generated keys through KeyShareKeys.
 func realityECDHEKey(state *utls.PubClientHandshakeState) *ecdh.PrivateKey {
 	if state == nil {
 		return nil
@@ -266,7 +265,7 @@ func realityECDHEKey(state *utls.PubClientHandshakeState) *ecdh.PrivateKey {
 			return keyShareKeys.MlkemEcdhe
 		}
 	}
-	return state.State13.EcdheKey // nolint:staticcheck
+	return nil
 }
 
 func (x *Reality) UnwrapDialer() netproxy.Dialer {

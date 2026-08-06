@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -24,12 +25,26 @@ func init() {
 type client interface {
 	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
 	DialPacketConn(conn net.Conn) (N.NetPacketConn, error)
+	Close() error
 }
+
+type preconnectClient interface {
+	Preconnect(ctx context.Context, count int) error
+}
+
+const preconnectTimeout = 10 * time.Second
 
 type Dialer struct {
 	server        M.Socksaddr
 	transportDial *singDialer
 	client        client
+	preconnect    int
+
+	lifecycleMu sync.Mutex
+	started     bool
+	closed      bool
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -54,6 +69,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	dialer := &Dialer{
 		server:        server,
 		transportDial: transportDial,
+		preconnect:    options.Preconnect,
 	}
 	psk := []byte(header.Password)
 	userKey := []byte(options.UserKey)
@@ -96,6 +112,67 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		dialer.client = v6Client
 	}
 	return dialer, nil
+}
+
+// Preconnect synchronously warms reusable Snell v4 sessions. Callers normally
+// use Start so warming follows the owning dialer's lifecycle.
+func (d *Dialer) Preconnect(ctx context.Context, count int) error {
+	if count == 0 {
+		return nil
+	}
+	client, ok := d.client.(preconnectClient)
+	if !ok {
+		return fmt.Errorf("snell: preconnect is unavailable for version 6")
+	}
+	return client.Preconnect(ctx, count)
+}
+
+// Start begins the optional best-effort preconnect task. It is idempotent so a
+// dialer reconstructed or adopted during reload can safely receive Start more
+// than once.
+func (d *Dialer) Start(ctx context.Context) error {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.started || d.closed {
+		return nil
+	}
+	d.started = true
+	if d.preconnect == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	preconnectCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	d.cancel = cancel
+	d.done = done
+	go func() {
+		defer close(done)
+		timeoutCtx, timeoutCancel := context.WithTimeout(preconnectCtx, preconnectTimeout)
+		defer timeoutCancel()
+		_ = d.Preconnect(timeoutCtx, d.preconnect)
+	}()
+	return nil
+}
+
+// Close stops any in-flight preconnect and releases reusable sessions.
+func (d *Dialer) Close() error {
+	d.lifecycleMu.Lock()
+	if d.closed {
+		d.lifecycleMu.Unlock()
+		return nil
+	}
+	d.closed = true
+	cancel, done := d.cancel, d.done
+	d.cancel = nil
+	d.done = nil
+	d.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	return d.client.Close()
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {

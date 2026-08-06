@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 type realityStubConn struct{}

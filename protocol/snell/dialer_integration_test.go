@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
@@ -181,7 +182,7 @@ func TestDialerExplicitIdentity(t *testing.T) {
 		Password:     testPSK,
 		Feature1: ClientOptions{
 			Version:  Version5,
-			Identity: true,
+			Identity: IdentityV1,
 		},
 	})
 	require.NoError(t, err)
@@ -193,6 +194,71 @@ func TestDialerExplicitIdentity(t *testing.T) {
 	require.NoError(t, conn.Close())
 }
 
+func TestDialerIdentityV2RoundTrip(t *testing.T) {
+	t.Parallel()
+	options := ClientOptions{Version: Version4, Identity: IdentityV2, ECHTLS: true}
+	dialer := newTestDialer(t, options)
+	conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
+	require.NoError(t, err)
+	_, err = conn.Write([]byte("identity-v2"))
+	require.NoError(t, err)
+	require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
+	response, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Equal(t, []byte("identity-v2"), response)
+	require.NoError(t, conn.Close())
+}
+
+func TestDialerPreconnectUsesWarmPool(t *testing.T) {
+	t.Parallel()
+	var physicalConnections atomic.Int32
+	options := ClientOptions{
+		Version:    Version4,
+		Identity:   IdentityV2,
+		ECHTLS:     true,
+		Reuse:      true,
+		Preconnect: 2,
+	}
+	dialer := newTestDialerWithCounter(t, options, &physicalConnections)
+	managed := dialer.(*Dialer)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, managed.Preconnect(ctx, 2))
+	require.Equal(t, int32(2), physicalConnections.Load())
+	conn, err := managed.DialContext(ctx, "tcp", "destination.example:443")
+	require.NoError(t, err)
+	require.Equal(t, int32(2), physicalConnections.Load())
+	require.NoError(t, conn.Close())
+	require.NoError(t, managed.Close())
+}
+
+func TestDialerPreconnectLifecycle(t *testing.T) {
+	t.Parallel()
+	base := &blockingPreconnectDialer{started: make(chan struct{}, 2)}
+	created, err := NewDialer(base, protocol.Header{
+		ProxyAddress: "proxy.example:443",
+		Password:     testPSK,
+		Feature1: ClientOptions{
+			Version:    Version4,
+			Reuse:      true,
+			ECHTLS:     true,
+			Preconnect: 1,
+		},
+	})
+	require.NoError(t, err)
+	managed := created.(*Dialer)
+	require.NoError(t, managed.Start(context.Background()))
+	select {
+	case <-base.started:
+	case <-time.After(time.Second):
+		t.Fatal("preconnect did not start")
+	}
+	require.NoError(t, managed.Start(context.Background()))
+	require.NoError(t, managed.Close())
+	require.Equal(t, int32(1), base.calls.Load())
+	require.NoError(t, managed.Close())
+}
+
 func newTestDialer(t *testing.T, options ClientOptions) netproxy.Dialer {
 	t.Helper()
 	return newTestDialerWithCounter(t, options, nil)
@@ -202,6 +268,12 @@ func newTestDialerWithCounter(t *testing.T, options ClientOptions, counter *atom
 	t.Helper()
 	service := newTestService(t, options)
 	base := &serviceDialer{service: service, connections: counter}
+	if options.Identity == IdentityV2 {
+		base.exporter = make([]byte, singSnell.IdentityExporterLength)
+		for index := range base.exporter {
+			base.exporter[index] = byte(index)
+		}
+	}
 	dialer, err := NewDialer(base, protocol.Header{
 		ProxyAddress: "proxy.example:443",
 		Password:     testPSK,
@@ -236,6 +308,7 @@ func newTestService(t *testing.T, options ClientOptions) singSnell.Service {
 	require.NoError(t, err)
 	serviceOptions := snellv5.ServiceOptions{
 		PSK:      []byte(testPSK),
+		Identity: options.Identity != singSnell.IdentityDisabled,
 		ObfsMode: obfsMode,
 		Handler:  handler,
 	}
@@ -254,6 +327,7 @@ type serviceDialer struct {
 	service     singSnell.Service
 	connections *atomic.Int32
 	networks    chan string
+	exporter    []byte
 }
 
 type identityCaptureDialer struct {
@@ -283,12 +357,40 @@ func (d *serviceDialer) DialContext(_ context.Context, network, _ string) (netpr
 		d.networks <- network
 	}
 	go func() {
-		err := d.service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+		serverConn := net.Conn(server)
+		if len(d.exporter) != 0 {
+			serverConn = &identityExporterConn{Conn: server, exporter: d.exporter}
+		}
+		err := d.service.NewConnection(context.Background(), serverConn, M.Socksaddr{}, nil)
 		if err != nil {
 			_ = server.Close()
 		}
 	}()
+	if len(d.exporter) != 0 {
+		return &identityExporterConn{Conn: client, exporter: d.exporter}, nil
+	}
 	return client, nil
+}
+
+type identityExporterConn struct {
+	net.Conn
+	exporter []byte
+}
+
+type blockingPreconnectDialer struct {
+	started chan struct{}
+	calls   atomic.Int32
+}
+
+func (d *blockingPreconnectDialer) DialContext(ctx context.Context, _, _ string) (netproxy.Conn, error) {
+	d.calls.Add(1)
+	d.started <- struct{}{}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c *identityExporterConn) ExportKeyingMaterial(string, []byte, int) ([]byte, error) {
+	return append([]byte(nil), c.exporter...), nil
 }
 
 type echoHandler struct{}

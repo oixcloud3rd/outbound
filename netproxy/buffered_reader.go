@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 // BufferedReaderConn wraps a Conn with a bufio.Reader so that callers using
