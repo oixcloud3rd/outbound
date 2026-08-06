@@ -13,7 +13,7 @@ import (
 	"testing"
 	"unsafe"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 func mustGenerateX25519Key(t *testing.T) *ecdh.PrivateKey {
@@ -52,19 +52,6 @@ func TestRealityECDHEKeyFallsBackToMlkemEcdhe(t *testing.T) {
 
 	if got := realityECDHEKey(state); got != key {
 		t.Fatalf("expected key from KeyShareKeys.MlkemEcdhe")
-	}
-}
-
-func TestRealityECDHEKeyFallsBackToDeprecatedField(t *testing.T) {
-	key := mustGenerateX25519Key(t)
-	state := &utls.PubClientHandshakeState{
-		State13: utls.TLS13OnlyState{
-			EcdheKey: key,
-		},
-	}
-
-	if got := realityECDHEKey(state); got != key {
-		t.Fatalf("expected key from deprecated EcdheKey field")
 	}
 }
 

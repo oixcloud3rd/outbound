@@ -12,9 +12,9 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/websocket v1.5.0
 	github.com/json-iterator/go v1.1.12
+	github.com/metacubex/utls v1.8.7
 	github.com/mzz2017/disk-bloom v1.0.1
 	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
-	github.com/refraction-networking/utls v1.8.2
 	github.com/sagernet/sing v0.8.12-0.20260727003324-d096a164bc7f
 	github.com/sagernet/sing-shadowtls v0.2.0
 	github.com/sagernet/sing-snell v0.0.0-20260919065743-e4148a9db725

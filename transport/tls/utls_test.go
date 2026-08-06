@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 // Share links carry the fingerprint as "fp". Xray and sing-box resolve that

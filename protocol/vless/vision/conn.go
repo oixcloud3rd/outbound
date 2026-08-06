@@ -16,7 +16,7 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 
 	"github.com/google/uuid"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 var (

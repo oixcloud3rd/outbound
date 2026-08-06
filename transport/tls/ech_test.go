@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"io"
 	"math/big"
 	"net"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
+	singSnell "github.com/sagernet/sing-snell"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/cryptobyte"
 )
@@ -75,11 +77,11 @@ func TestTLSNegotiatesECH(t *testing.T) {
 			}
 			base := &echServerDialer{
 				config: serverConfig,
-				states: make(chan gotls.ConnectionState, 1),
+				states: make(chan echObservation, 1),
 				errors: make(chan error, 1),
 			}
 			link := implementation + "://server.example:443?sni=secret.example&allowInsecure=true&alpn=http%2F1.1&ech-config=" +
-				url.QueryEscape(base64.StdEncoding.EncodeToString(echConfigList))
+				url.QueryEscape(base64.StdEncoding.EncodeToString(echConfigList)) + "&snell-ech=true"
 			if implementation == "utls" {
 				link += "&utlsImitate=chrome_auto"
 			}
@@ -95,15 +97,57 @@ func TestTLSNegotiatesECH(t *testing.T) {
 				}
 			}
 			require.NotNil(t, connection)
+			clientExporter, err := singSnell.ExportIdentityKeyingMaterial(connection.(net.Conn))
+			require.NoError(t, err)
 			select {
-			case state := <-base.states:
-				require.True(t, state.ECHAccepted)
-				require.Equal(t, "secret.example", state.ServerName)
-				require.Equal(t, "http/1.1", state.NegotiatedProtocol)
+			case observation := <-base.states:
+				require.True(t, observation.state.ECHAccepted)
+				require.Equal(t, "secret.example", observation.state.ServerName)
+				require.Equal(t, "http/1.1", observation.state.NegotiatedProtocol)
+				require.Equal(t, observation.exporter, clientExporter)
 			case serverErr := <-base.errors:
 				t.Fatalf("ECH server handshake failed: %v", serverErr)
 			case <-time.After(5 * time.Second):
 				t.Fatal("timed out waiting for ECH server handshake")
+			}
+		})
+	}
+}
+
+func TestSnellECHTLSSessionResumption(t *testing.T) {
+	for _, implementation := range []string{"tls", "utls"} {
+		t.Run(implementation, func(t *testing.T) {
+			echConfig, echConfigList, echPrivateKey := makeECHConfig(t)
+			serverConfig := &gotls.Config{
+				MinVersion:   gotls.VersionTLS13,
+				NextProtos:   []string{"snell-ech/1"},
+				Certificates: []gotls.Certificate{makeServerCertificate(t)},
+				EncryptedClientHelloKeys: []gotls.EncryptedClientHelloKey{{
+					Config:     echConfig,
+					PrivateKey: echPrivateKey,
+				}},
+			}
+			base := &echServerDialer{
+				config:    serverConfig,
+				states:    make(chan echObservation, 2),
+				errors:    make(chan error, 2),
+				writeByte: true,
+			}
+			link := implementation + "://server.example:443?sni=secret.example&allowInsecure=true&alpn=snell-ech%2F1&ech-config=" +
+				url.QueryEscape(base64.StdEncoding.EncodeToString(echConfigList)) + "&snell-ech=true"
+			if implementation == "utls" {
+				link += "&utlsImitate=chrome_auto"
+			}
+			created, _, err := NewTls(&dialer.ExtraOption{}, base, link)
+			require.NoError(t, err)
+			for attempt := 0; attempt < 2; attempt++ {
+				connection, dialErr := created.DialContext(context.Background(), "tcp", "ignored.example:443")
+				require.NoError(t, dialErr)
+				payload, readErr := io.ReadAll(connection)
+				require.NoError(t, readErr)
+				require.Equal(t, []byte{1}, payload)
+				observation := <-base.states
+				require.Equal(t, attempt == 1 && implementation == "tls", observation.state.DidResume)
 			}
 		})
 	}
@@ -159,9 +203,15 @@ func makeServerCertificate(t *testing.T) gotls.Certificate {
 }
 
 type echServerDialer struct {
-	config *gotls.Config
-	states chan gotls.ConnectionState
-	errors chan error
+	config    *gotls.Config
+	states    chan echObservation
+	errors    chan error
+	writeByte bool
+}
+
+type echObservation struct {
+	state    gotls.ConnectionState
+	exporter []byte
 }
 
 func (d *echServerDialer) DialContext(context.Context, string, string) (netproxy.Conn, error) {
@@ -169,7 +219,20 @@ func (d *echServerDialer) DialContext(context.Context, string, string) (netproxy
 	go func() {
 		connection := gotls.Server(server, d.config)
 		if err := connection.Handshake(); err == nil {
-			d.states <- connection.ConnectionState()
+			state := connection.ConnectionState()
+			exporter, exportErr := state.ExportKeyingMaterial(
+				singSnell.IdentityExporterLabel,
+				[]byte{},
+				singSnell.IdentityExporterLength,
+			)
+			if exportErr != nil {
+				d.errors <- exportErr
+			} else {
+				if d.writeByte {
+					_, _ = connection.Write([]byte{1})
+				}
+				d.states <- echObservation{state: state, exporter: exporter}
+			}
 		} else {
 			d.errors <- err
 		}

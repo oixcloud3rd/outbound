@@ -1,12 +1,16 @@
 package snell
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/dialer"
@@ -16,7 +20,12 @@ import (
 	transportTLS "github.com/daeuniverse/outbound/transport/tls"
 )
 
-const snellECHTLSALPN = "h2"
+const (
+	snellECHTLSALPN         = "snell-ech/1"
+	snellECHTLSPreviousALPN = "oix-snell/1"
+	snellECHTLSLegacyALPN   = "h2"
+	snellPreconnectTimeout  = 10 * time.Second
+)
 
 func init() {
 	dialer.FromLinkRegister("snell", NewSnell)
@@ -33,8 +42,11 @@ type Snell struct {
 	Obfs               string
 	ObfsHost           string
 	Mode               string
-	Identity           bool
+	Identity           protocolSnell.IdentityVersion
 	IdentityExplicit   bool
+	ALPN               string
+	LegacyFallback     bool
+	Preconnect         int
 	SNI                string
 	ECHConfig          string
 	SkipCertVerify     bool
@@ -80,17 +92,28 @@ func ParseURL(link string) (*Snell, error) {
 	if obfs == "" {
 		obfs = "none"
 	}
-	identityValue, identityExplicit := firstQuery(query, "identity")
-	identity := false
-	if identityExplicit {
-		identity, err = strconv.ParseBool(identityValue)
-		if err != nil {
-			return nil, fmt.Errorf("snell: invalid identity value %q", identityValue)
-		}
+	identity, identityExplicit, err := parseIdentity(query)
+	if err != nil {
+		return nil, err
 	}
 	reuse, err := parseBool(query, false, "reuse")
 	if err != nil {
 		return nil, err
+	}
+	legacyFallback, err := parseBool(query, false, "legacy-fallback")
+	if err != nil {
+		return nil, err
+	}
+	preconnect, err := parseInt(query, 0, "preconnect")
+	if err != nil {
+		return nil, err
+	}
+	alpn, err := resolveSnellECHTLSALPN(query.Get("alpn"), query.Get("protocol"))
+	if err != nil {
+		return nil, err
+	}
+	if legacyFallback && alpn == "" {
+		alpn = snellECHTLSALPN
 	}
 	skipVerify, skipVerifyExplicit, err := parseBoolWithPresence(query, false,
 		"skip-cert-verify", "allowInsecure", "allow_insecure", "skipVerify", "insecure")
@@ -112,6 +135,9 @@ func ParseURL(link string) (*Snell, error) {
 		Mode:               query.Get("mode"),
 		Identity:           identity,
 		IdentityExplicit:   identityExplicit,
+		ALPN:               alpn,
+		LegacyFallback:     legacyFallback,
+		Preconnect:         preconnect,
 		SNI:                query.Get("sni"),
 		ECHConfig:          firstValue(query, "ech-config", "echConfig"),
 		SkipCertVerify:     skipVerify,
@@ -139,6 +165,12 @@ func (s *Snell) validate() error {
 	if len(s.UserKey) > 255 {
 		return fmt.Errorf("snell: user key is longer than 255 bytes")
 	}
+	if s.Identity > protocolSnell.IdentityV2 {
+		return fmt.Errorf("snell: identity must be between 0 and 2")
+	}
+	if s.Preconnect < 0 || s.Preconnect > 4 {
+		return fmt.Errorf("snell: preconnect must be between 0 and 4")
+	}
 	switch s.Version {
 	case protocolSnell.Version4, protocolSnell.Version5:
 		if s.Mode != "" {
@@ -153,7 +185,8 @@ func (s *Snell) validate() error {
 		if len(s.PSK) < 12 || len(s.PSK) > 255 {
 			return fmt.Errorf("snell: version 6 PSK length must be between 12 and 255 bytes")
 		}
-		if s.Obfs != "none" || s.ObfsHost != "" || s.Identity || s.IdentityExplicit ||
+		if s.Obfs != "none" || s.ObfsHost != "" || s.Identity != protocolSnell.IdentityDisabled || s.IdentityExplicit ||
+			s.ALPN != "" || s.LegacyFallback || s.Preconnect != 0 ||
 			s.ECHConfig != "" || s.SNI != "" ||
 			s.SkipVerifyExplicit || s.TLSImplementation != "" || s.ClientFingerprint != "" {
 			return fmt.Errorf("snell: version 6 cannot be combined with obfs, identity, or ECH-TLS")
@@ -173,8 +206,21 @@ func (s *Snell) validate() error {
 		if s.TLSImplementation != "" && s.TLSImplementation != "tls" && s.TLSImplementation != "utls" {
 			return fmt.Errorf("snell: unsupported TLS implementation %q", s.TLSImplementation)
 		}
+		if s.SkipCertVerify {
+			return fmt.Errorf("snell: %s requires certificate verification", snellECHTLSALPN)
+		}
+		if s.Identity == protocolSnell.IdentityV2 && s.ALPN == snellECHTLSLegacyALPN {
+			return fmt.Errorf("snell: identity v2 with h2 requires legacy-fallback from %s", snellECHTLSALPN)
+		}
+		if s.LegacyFallback && s.ALPN != snellECHTLSALPN {
+			return fmt.Errorf("snell: legacy-fallback requires alpn=%s", snellECHTLSALPN)
+		}
+		if s.Preconnect > 0 && !s.Reuse {
+			return fmt.Errorf("snell: preconnect requires ECH-TLS and reuse")
+		}
 	} else if s.ECHConfig != "" || s.SNI != "" ||
-		s.SkipVerifyExplicit || s.TLSImplementation != "" || s.ClientFingerprint != "" {
+		s.SkipVerifyExplicit || s.TLSImplementation != "" || s.ClientFingerprint != "" ||
+		s.ALPN != "" || s.LegacyFallback || s.Preconnect != 0 || s.Identity == protocolSnell.IdentityV2 {
 		return fmt.Errorf("snell: ECH-TLS parameters require obfs=ech-tls")
 	}
 	return nil
@@ -185,37 +231,72 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 		return nil, nil, err
 	}
 	address := net.JoinHostPort(s.Server, strconv.Itoa(s.Port))
-	current := nextDialer
-	var err error
-	if s.Obfs == "ech-tls" {
-		tlsURL := s.echTLSURL(option, address)
-		current, _, err = transportTLS.NewTls(option, current, tlsURL.String())
+	primaryALPN := s.ALPN
+	if s.Obfs == "ech-tls" && primaryALPN == "" {
+		// Preserve the implicit h2 behavior of existing direct share links.
+		primaryALPN = snellECHTLSLegacyALPN
 	}
+	primary, err := s.newProtocolDialer(option, nextDialer, address, primaryALPN, s.Identity, s.Preconnect)
 	if err != nil {
 		return nil, nil, err
 	}
+	current := primary
+	if s.LegacyFallback {
+		legacyIdentity := s.Identity
+		if legacyIdentity == protocolSnell.IdentityV2 {
+			legacyIdentity = protocolSnell.IdentityV1
+		}
+		legacy, legacyErr := s.newProtocolDialer(option, nextDialer, address, snellECHTLSLegacyALPN, legacyIdentity, 0)
+		if legacyErr != nil {
+			_ = closeDialer(primary)
+			return nil, nil, legacyErr
+		}
+		current, err = newLegacyFallbackDialer(primary, legacy, s.Preconnect)
+		if err != nil {
+			_ = closeDialer(primary)
+			_ = closeDialer(legacy)
+			return nil, nil, err
+		}
+	}
+	return current, &dialer.Property{Name: s.Name, Address: address, Protocol: "snell", Link: s.ExportToURL()}, nil
+}
+
+func (s *Snell) newProtocolDialer(
+	option *dialer.ExtraOption,
+	nextDialer netproxy.Dialer,
+	address string,
+	alpn string,
+	identity protocolSnell.IdentityVersion,
+	preconnect int,
+) (netproxy.Dialer, error) {
+	current := nextDialer
 	protocolObfs := s.Obfs
-	if protocolObfs == "ech-tls" {
+	if s.Obfs == "ech-tls" {
+		tlsURL := s.echTLSURL(option, address, alpn)
+		var err error
+		current, _, err = transportTLS.NewTls(option, current, tlsURL.String())
+		if err != nil {
+			return nil, err
+		}
+		current = &echTLSDialer{Dialer: current, alpn: alpn}
 		protocolObfs = "none"
 	}
-	current, err = protocol.NewDialer("snell", current, protocol.Header{
+	return protocol.NewDialer("snell", current, protocol.Header{
 		ProxyAddress: address,
 		Password:     s.PSK,
 		IsClient:     true,
 		Feature1: protocolSnell.ClientOptions{
-			Version:  s.Version,
-			UserKey:  s.UserKey,
-			Reuse:    s.Reuse,
-			Identity: s.Identity,
-			Mode:     s.Mode,
-			Obfs:     protocolObfs,
-			ObfsHost: s.ObfsHost,
+			Version:    s.Version,
+			UserKey:    s.UserKey,
+			Reuse:      s.Reuse,
+			Identity:   identity,
+			Preconnect: preconnect,
+			ECHTLS:     s.Obfs == "ech-tls",
+			Mode:       s.Mode,
+			Obfs:       protocolObfs,
+			ObfsHost:   s.ObfsHost,
 		},
 	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return current, &dialer.Property{Name: s.Name, Address: address, Protocol: "snell", Link: s.ExportToURL()}, nil
 }
 
 func (s *Snell) ExportToURL() string {
@@ -245,11 +326,20 @@ func (s *Snell) ExportToURL() string {
 			query.Set("obfs-host", s.ObfsHost)
 		}
 		if s.IdentityExplicit {
-			query.Set("identity", strconv.FormatBool(s.Identity))
+			query.Set("identity", strconv.Itoa(int(s.Identity)))
 		}
 	}
 	if s.Obfs == "ech-tls" {
 		query.Set("ech-config", s.ECHConfig)
+		if s.ALPN != "" {
+			query.Set("alpn", s.ALPN)
+		}
+		if s.LegacyFallback {
+			query.Set("legacy-fallback", "true")
+		}
+		if s.Preconnect != 0 {
+			query.Set("preconnect", strconv.Itoa(s.Preconnect))
+		}
 		if s.SNI != "" {
 			query.Set("sni", s.SNI)
 		}
@@ -267,7 +357,7 @@ func (s *Snell) ExportToURL() string {
 	return u.String()
 }
 
-func (s *Snell) echTLSURL(option *dialer.ExtraOption, address string) *url.URL {
+func (s *Snell) echTLSURL(option *dialer.ExtraOption, address, alpn string) *url.URL {
 	tlsImplementation := s.TLSImplementation
 	if tlsImplementation == "" {
 		tlsImplementation = option.TlsImplementation
@@ -286,21 +376,193 @@ func (s *Snell) echTLSURL(option *dialer.ExtraOption, address string) *url.URL {
 	if fingerprint == "" {
 		fingerprint = option.UtlsImitate
 	}
-	skipCertVerify := option.AllowInsecure
-	if s.SkipVerifyExplicit {
-		skipCertVerify = s.SkipCertVerify
-	}
 	tlsURL := &url.URL{Scheme: tlsImplementation, Host: address}
 	tlsQuery := tlsURL.Query()
 	tlsQuery.Set("sni", sni)
 	tlsQuery.Set("ech-config", s.ECHConfig)
-	tlsQuery.Set("alpn", snellECHTLSALPN)
-	tlsQuery.Set("allowInsecure", common.BoolToString(skipCertVerify))
+	tlsQuery.Set("alpn", alpn)
+	tlsQuery.Set("allowInsecure", common.BoolToString(false))
+	tlsQuery.Set("snell-ech", "true")
 	if fingerprint != "" {
 		tlsQuery.Set("utlsImitate", fingerprint)
 	}
 	tlsURL.RawQuery = tlsQuery.Encode()
 	return tlsURL
+}
+
+type echTLSDialer struct {
+	netproxy.Dialer
+	alpn string
+}
+
+func (d *echTLSDialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {
+	conn, err := d.Dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	if err = transportTLS.ValidateECHConnection(conn, d.alpn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+type managedSnellDialer interface {
+	netproxy.Dialer
+	Start(context.Context) error
+	Preconnect(context.Context, int) error
+	Close() error
+}
+
+type legacyFallbackDialer struct {
+	primary managedSnellDialer
+	legacy  managedSnellDialer
+	count   int
+
+	lifecycleMu sync.Mutex
+	started     bool
+	closed      bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+}
+
+func newLegacyFallbackDialer(primary, legacy netproxy.Dialer, count int) (netproxy.Dialer, error) {
+	primaryManaged, primaryOK := primary.(managedSnellDialer)
+	legacyManaged, legacyOK := legacy.(managedSnellDialer)
+	if !primaryOK || !legacyOK {
+		return nil, errors.New("snell: legacy fallback dialers do not support lifecycle management")
+	}
+	return &legacyFallbackDialer{
+		primary: primaryManaged,
+		legacy:  legacyManaged,
+		count:   count,
+	}, nil
+}
+
+func (d *legacyFallbackDialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {
+	conn, err := d.primary.DialContext(ctx, network, address)
+	if err == nil || !transportTLS.IsALPNCompatibilityError(err) {
+		return conn, err
+	}
+	return d.legacy.DialContext(ctx, network, address)
+}
+
+func (d *legacyFallbackDialer) Preconnect(ctx context.Context, count int) error {
+	err := d.primary.Preconnect(ctx, count)
+	if err == nil || !transportTLS.IsALPNCompatibilityError(err) {
+		return err
+	}
+	return d.legacy.Preconnect(ctx, count)
+}
+
+func (d *legacyFallbackDialer) Start(ctx context.Context) error {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.started || d.closed {
+		return nil
+	}
+	d.started = true
+	if d.count == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	preconnectCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	d.cancel = cancel
+	d.done = done
+	go func() {
+		defer close(done)
+		timeoutCtx, timeoutCancel := context.WithTimeout(preconnectCtx, snellPreconnectTimeout)
+		defer timeoutCancel()
+		_ = d.Preconnect(timeoutCtx, d.count)
+	}()
+	return nil
+}
+
+func (d *legacyFallbackDialer) Close() error {
+	d.lifecycleMu.Lock()
+	if d.closed {
+		d.lifecycleMu.Unlock()
+		return nil
+	}
+	d.closed = true
+	cancel, done := d.cancel, d.done
+	d.cancel = nil
+	d.done = nil
+	d.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	return errors.Join(d.primary.Close(), d.legacy.Close())
+}
+
+func closeDialer(dialer netproxy.Dialer) error {
+	if closer, ok := dialer.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func parseIdentity(values url.Values) (protocolSnell.IdentityVersion, bool, error) {
+	identityValue, identityExplicit := firstQuery(values, "identity")
+	versionValue, versionExplicit := firstQuery(values, "identity-version")
+	identity := protocolSnell.IdentityDisabled
+	var err error
+	if identityExplicit {
+		identity, err = parseIdentityValue(identityValue, true)
+		if err != nil {
+			return 0, true, err
+		}
+	}
+	if versionExplicit {
+		version, versionErr := parseIdentityValue(versionValue, false)
+		if versionErr != nil {
+			return 0, true, versionErr
+		}
+		if identityExplicit && version != identity {
+			return 0, true, fmt.Errorf("snell: identity and identity-version values conflict")
+		}
+		identity = version
+	}
+	return identity, identityExplicit || versionExplicit, nil
+}
+
+func parseIdentityValue(value string, allowBool bool) (protocolSnell.IdentityVersion, error) {
+	if allowBool {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			if parsed {
+				return protocolSnell.IdentityV1, nil
+			}
+			return protocolSnell.IdentityDisabled, nil
+		}
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 || parsed > 2 {
+		return 0, fmt.Errorf("snell: invalid identity value %q", value)
+	}
+	return protocolSnell.IdentityVersion(parsed), nil
+}
+
+func resolveSnellECHTLSALPN(alpn, protocol string) (string, error) {
+	if protocol == snellECHTLSPreviousALPN {
+		protocol = snellECHTLSALPN
+	}
+	if alpn == snellECHTLSPreviousALPN {
+		alpn = snellECHTLSALPN
+	}
+	if alpn != "" && protocol != "" && alpn != protocol {
+		return "", fmt.Errorf("snell: ECH-TLS alpn and protocol values conflict")
+	}
+	if alpn == "" {
+		alpn = protocol
+	}
+	if alpn != "" && alpn != snellECHTLSALPN && alpn != snellECHTLSLegacyALPN {
+		return "", fmt.Errorf("snell: unsupported ECH-TLS ALPN %q", alpn)
+	}
+	return alpn, nil
 }
 
 func firstQuery(values url.Values, keys ...string) (string, bool) {
@@ -310,6 +572,18 @@ func firstQuery(values url.Values, keys ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func parseInt(values url.Values, fallback int, key string) (int, error) {
+	value, ok := firstQuery(values, key)
+	if !ok || value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("snell: invalid %s value %q", key, value)
+	}
+	return parsed, nil
 }
 
 func firstValue(values url.Values, keys ...string) string {
