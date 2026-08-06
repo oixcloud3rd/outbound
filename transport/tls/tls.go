@@ -12,6 +12,7 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
+	utls "github.com/metacubex/utls"
 )
 
 // Tls is a base Tls struct
@@ -28,9 +29,13 @@ type Tls struct {
 	fragmentMaxLength   int64
 	fragmentMinInterval int64
 	fragmentMaxInterval int64
+	snellECH            bool
+	utlsSessionCache    utls.ClientSessionCache
 
 	tlsConfig *tls.Config
 }
+
+const snellECHSessionCacheCapacity = 32
 
 func (s *Tls) UnwrapDialer() netproxy.Dialer {
 	return s.dialer
@@ -73,6 +78,10 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 		t.serverName = u.Hostname()
 	}
 	t.passthroughUdp, _ = strconv.ParseBool(u.Query().Get("passthroughUdp"))
+	t.snellECH, _, err = optionalBool(query, "snell-ech")
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// skipVerify
 	allowInsecure, explicit, err := optionalBool(query,
@@ -102,6 +111,14 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 		}
 		t.tlsConfig.MinVersion = tls.VersionTLS13
 		t.tlsConfig.EncryptedClientHelloConfigList = decoded
+	}
+	if t.snellECH {
+		if len(t.tlsConfig.EncryptedClientHelloConfigList) == 0 {
+			return nil, nil, fmt.Errorf("Snell ECH-TLS requires ech-config")
+		}
+		t.tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
+		t.tlsConfig.Renegotiation = tls.RenegotiateNever
+		t.utlsSessionCache = utls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
 	}
 
 	if option.TlsFragment {
@@ -205,15 +222,28 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 				return nil, err
 			}
 
-			utlsConn, err := newUTLSClient(&netproxy.FakeNetConn{
+			uConfig := uTLSConfigFromTLSConfig(s.tlsConfig)
+			if s.snellECH {
+				configureUTLSSnellECH(uConfig, s.utlsSessionCache)
+			}
+			rawConn := &netproxy.FakeNetConn{
 				Conn:  rc,
 				LAddr: nil,
 				RAddr: nil,
-			}, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
-			if err != nil {
-				return nil, err
 			}
-			tlsConn = utlsConn
+			if s.snellECH {
+				tlsConn = &utlsConnWrapper{
+					UConn:         utls.UClient(rawConn, uConfig, *clientHelloID),
+					nextProtocols: append([]string(nil), uConfig.NextProtos...),
+					snellECH:      true,
+				}
+			} else {
+				utlsConn, err := newUTLSClient(rawConn, uConfig, *clientHelloID)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn = &utlsConnWrapper{UConn: utlsConn}
+			}
 
 		default:
 			return nil, fmt.Errorf("unknown tls implementation: %v", s.tlsImplentation)

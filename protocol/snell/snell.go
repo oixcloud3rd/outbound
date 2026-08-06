@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	singSnell "github.com/sagernet/sing-snell"
 )
 
 const (
@@ -14,16 +16,26 @@ const (
 	Version6 = 6
 )
 
+type IdentityVersion = singSnell.IdentityVersion
+
+const (
+	IdentityDisabled = singSnell.IdentityDisabled
+	IdentityV1       = singSnell.IdentityV1
+	IdentityV2       = singSnell.IdentityV2
+)
+
 // ClientOptions contains protocol-specific client settings. ECH-TLS is
 // assembled by dialer/snell before the protocol client is created.
 type ClientOptions struct {
-	Version  int
-	UserKey  string
-	Reuse    bool
-	Identity bool
-	Mode     string
-	Obfs     string
-	ObfsHost string
+	Version    int
+	UserKey    string
+	Reuse      bool
+	Identity   IdentityVersion
+	Preconnect int
+	ECHTLS     bool
+	Mode       string
+	Obfs       string
+	ObfsHost   string
 }
 
 func (o ClientOptions) normalizedObfs() string {
@@ -40,6 +52,12 @@ func (o ClientOptions) validate(psk string) error {
 	if len(o.UserKey) > 255 {
 		return errors.New("snell: user key is longer than 255 bytes")
 	}
+	if o.Identity > IdentityV2 {
+		return fmt.Errorf("snell: identity must be between 0 and 2")
+	}
+	if o.Preconnect < 0 || o.Preconnect > 4 {
+		return errors.New("snell: preconnect must be between 0 and 4")
+	}
 	switch o.Version {
 	case Version4, Version5:
 		if o.Mode != "" {
@@ -50,9 +68,18 @@ func (o ClientOptions) validate(psk string) error {
 		default:
 			return fmt.Errorf("snell: unsupported obfs %q", o.Obfs)
 		}
+		if o.Identity == IdentityV2 && !o.ECHTLS {
+			return errors.New("snell: identity v2 requires ECH-TLS")
+		}
+		if o.Preconnect > 0 && (!o.ECHTLS || !o.Reuse) {
+			return errors.New("snell: preconnect requires ECH-TLS and reuse")
+		}
 	case Version6:
-		if o.Identity {
+		if o.Identity != IdentityDisabled {
 			return errors.New("snell: identity is not supported by version 6")
+		}
+		if o.Preconnect != 0 || o.ECHTLS {
+			return errors.New("snell: version 6 cannot be combined with ECH-TLS or preconnect")
 		}
 		if len(psk) < 12 || len(psk) > 255 {
 			return errors.New("snell: version 6 PSK length must be between 12 and 255 bytes")

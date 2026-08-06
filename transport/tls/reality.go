@@ -34,7 +34,7 @@ import (
 	"unsafe"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
@@ -46,7 +46,7 @@ var (
 	Reality_Version_z byte = 10
 )
 
-//go:linkname aesgcmPreferred github.com/refraction-networking/utls.aesgcmPreferred
+//go:linkname aesgcmPreferred github.com/metacubex/utls.aesgcmPreferred
 func aesgcmPreferred(ciphers []uint16) bool
 
 type RealityUConn struct {
@@ -138,8 +138,6 @@ type Reality struct {
 }
 
 // realityECDHEKey returns the TLS 1.3 ECDHE private key used by REALITY.
-// Newer uTLS versions populate KeyShareKeys and may leave the deprecated
-// EcdheKey field unset, so keep compatibility with both layouts.
 func realityECDHEKey(state *utls.PubClientHandshakeState) *ecdh.PrivateKey {
 	if state == nil {
 		return nil
@@ -152,7 +150,7 @@ func realityECDHEKey(state *utls.PubClientHandshakeState) *ecdh.PrivateKey {
 			return keyShareKeys.MlkemEcdhe
 		}
 	}
-	return state.State13.EcdheKey // nolint:staticcheck
+	return nil
 }
 
 func (x *Reality) UnwrapDialer() netproxy.Dialer {

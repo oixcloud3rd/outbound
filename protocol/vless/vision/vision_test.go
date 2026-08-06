@@ -7,7 +7,7 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	outboundtls "github.com/daeuniverse/outbound/transport/tls"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 type intrinsicConnWrapper struct {

@@ -1,11 +1,12 @@
 package tls
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 )
 
 func newUTLSClient(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
@@ -24,6 +25,66 @@ func newUTLSClient(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*
 		return nil, err
 	}
 	return client, nil
+}
+
+type utlsConnWrapper struct {
+	*utls.UConn
+	nextProtocols []string
+	snellECH      bool
+}
+
+func (c *utlsConnWrapper) HandshakeContext(ctx context.Context) error {
+	if !c.snellECH {
+		return c.UConn.HandshakeContext(ctx)
+	}
+	if err := c.BuildHandshakeState(); err != nil {
+		return err
+	}
+	foundALPN := false
+	originalExtensions := append([]utls.TLSExtension(nil), c.Extensions...)
+	extensions := make([]utls.TLSExtension, 0, len(originalExtensions))
+	for _, extension := range originalExtensions {
+		switch typed := extension.(type) {
+		case *utls.ALPNExtension:
+			foundALPN = true
+			typed.AlpnProtocols = append([]string(nil), c.nextProtocols...)
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			continue
+		case *utls.RenegotiationInfoExtension:
+			typed.Renegotiation = utls.RenegotiateNever
+		}
+		extensions = append(extensions, extension)
+	}
+	if !foundALPN && len(c.nextProtocols) > 0 {
+		extensions = append(extensions, &utls.ALPNExtension{AlpnProtocols: append([]string(nil), c.nextProtocols...)})
+	}
+	c.Extensions = extensions
+	if err := c.BuildHandshakeState(); err != nil {
+		return err
+	}
+	return c.UConn.HandshakeContext(ctx)
+}
+
+func (c *utlsConnWrapper) TLSConnectionState() ConnectionState {
+	state := c.ConnectionState()
+	return ConnectionState{
+		ECHAccepted:        state.ECHAccepted,
+		NegotiatedProtocol: state.NegotiatedProtocol,
+	}
+}
+
+func (c *utlsConnWrapper) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	state := c.ConnectionState()
+	return state.ExportKeyingMaterial(label, context, length)
+}
+
+func configureUTLSSnellECH(config *utls.Config, cache utls.ClientSessionCache) {
+	if cache == nil {
+		cache = utls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
+	}
+	config.ClientSessionCache = cache
+	config.Renegotiation = utls.RenegotiateNever
+	config.OmitEmptyPsk = true
 }
 
 func setUTLSSpecALPN(spec *utls.ClientHelloSpec, protocols []string) {

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 	shadowtls "github.com/sagernet/sing-shadowtls"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
