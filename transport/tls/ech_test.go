@@ -143,10 +143,13 @@ func TestSnellECHTLSSessionResumption(t *testing.T) {
 			for attempt := 0; attempt < 2; attempt++ {
 				connection, dialErr := created.DialContext(context.Background(), "tcp", "ignored.example:443")
 				require.NoError(t, dialErr)
+				clientExporter, exportErr := singSnell.ExportIdentityKeyingMaterial(connection.(net.Conn))
+				require.NoError(t, exportErr)
 				payload, readErr := io.ReadAll(connection)
 				require.NoError(t, readErr)
 				require.Equal(t, []byte{1}, payload)
 				observation := <-base.states
+				require.Equal(t, observation.exporter, clientExporter)
 				require.Equal(t, attempt == 1 && implementation == "tls", observation.state.DidResume)
 			}
 		})

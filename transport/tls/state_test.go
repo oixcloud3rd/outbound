@@ -51,7 +51,7 @@ func TestSnellECHConfiguresSessionCaches(t *testing.T) {
 	configuration := created.(*Tls)
 	require.NotNil(t, configuration.tlsConfig.ClientSessionCache)
 	uConfig := uTLSConfigFromTLSConfig(configuration.tlsConfig)
-	configureUTLSSnellECH(uConfig, configuration.utlsSessionCache)
+	configureUTLSSnellECH(uConfig, configuration.uClientSessionCache)
 	require.NotNil(t, uConfig.ClientSessionCache)
 	require.True(t, uConfig.OmitEmptyPsk)
 }

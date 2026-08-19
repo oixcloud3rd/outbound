@@ -4,9 +4,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"io"
+	"net"
 	"testing"
 
 	utls "github.com/metacubex/utls"
+	"github.com/stretchr/testify/require"
 )
 
 // Share links carry the fingerprint as "fp". Xray and sing-box resolve that
@@ -96,4 +98,40 @@ func TestUTLSConfigFromTLSConfigPreservesClientSettings(t *testing.T) {
 	if stdConfig.CipherSuites[0] != tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
 		t.Fatal("expected CipherSuites slice to be copied")
 	}
+}
+
+func TestConfigureUTLSSnellECHUsesUClientSessionCache(t *testing.T) {
+	cache := utls.NewLRUClientSessionCache(2)
+	config := &utls.Config{}
+
+	configureUTLSSnellECH(config, cache)
+
+	require.Same(t, cache, config.ClientSessionCache)
+	require.Equal(t, utls.RenegotiateNever, config.Renegotiation)
+	require.True(t, config.OmitEmptyPsk)
+}
+
+func TestUTLSDisableRenegotiationRewritesClientHello(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	connection := &utlsConnWrapper{
+		UConn: utls.UClient(client, &utls.Config{
+			ServerName:         "example.com",
+			InsecureSkipVerify: true,
+		}, utls.HelloChrome_Auto),
+		disableRenegotiation: true,
+	}
+
+	require.NoError(t, connection.prepareClientHello())
+	found := false
+	for _, extension := range connection.Extensions {
+		if renegotiation, ok := extension.(*utls.RenegotiationInfoExtension); ok {
+			found = true
+			require.Equal(t, utls.RenegotiateNever, renegotiation.Renegotiation)
+		}
+	}
+	require.True(t, found, "Chrome ClientHello should contain renegotiation_info")
 }
