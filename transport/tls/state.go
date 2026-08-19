@@ -39,6 +39,9 @@ func GetConnectionState(conn netproxy.Conn) (ConnectionState, bool) {
 			NegotiatedProtocol: state.NegotiatedProtocol,
 		}, true
 	}
+	if intrinsic := netproxy.UnwrapIntrinsicConn(conn); intrinsic != nil && intrinsic != conn {
+		return GetConnectionState(intrinsic)
+	}
 	return ConnectionState{}, false
 }
 

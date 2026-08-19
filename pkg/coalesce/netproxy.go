@@ -1,6 +1,8 @@
 package coalesce
 
 import (
+	cryptotls "crypto/tls"
+	"errors"
 	"net"
 	"time"
 
@@ -38,6 +40,25 @@ func (f *FlushConn) Write(b []byte) (int, error) {
 		err = ferr
 	}
 	return n, err
+}
+
+// ExportKeyingMaterial preserves TLS exporter access for protocols such as
+// Snell identity v2 that derive per-connection keys from the TLS session.
+func (f *FlushConn) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	exporter, ok := f.Conn.(interface {
+		ExportKeyingMaterial(string, []byte, int) ([]byte, error)
+	})
+	if !ok {
+		stateProvider, hasState := f.Conn.(interface {
+			ConnectionState() cryptotls.ConnectionState
+		})
+		if !hasState {
+			return nil, errors.New("TLS exporter is unavailable")
+		}
+		state := stateProvider.ConnectionState()
+		return state.ExportKeyingMaterial(label, context, length)
+	}
+	return exporter.ExportKeyingMaterial(label, context, length)
 }
 
 // IntrinsicConn forwards the wrapper-peeling convention so callers that need

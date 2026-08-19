@@ -18,20 +18,21 @@ import (
 
 // Tls is a base Tls struct
 type Tls struct {
-	dialer              netproxy.Dialer
-	addr                string
-	serverName          string
-	skipVerify          bool
-	tlsImplentation     string
-	utlsImitate         string
-	passthroughUdp      bool
-	fragmentation       bool
-	fragmentMinLength   int64
-	fragmentMaxLength   int64
-	fragmentMinInterval int64
-	fragmentMaxInterval int64
-	snellECH            bool
-	utlsSessionCache    utls.ClientSessionCache
+	dialer               netproxy.Dialer
+	addr                 string
+	serverName           string
+	skipVerify           bool
+	tlsImplentation      string
+	utlsImitate          string
+	passthroughUdp       bool
+	fragmentation        bool
+	fragmentMinLength    int64
+	fragmentMaxLength    int64
+	fragmentMinInterval  int64
+	fragmentMaxInterval  int64
+	snellECH             bool
+	uClientSessionCache  utls.ClientSessionCache
+	disableRenegotiation bool
 
 	tlsConfig *tls.Config
 }
@@ -126,7 +127,10 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 		}
 		t.tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
 		t.tlsConfig.Renegotiation = tls.RenegotiateNever
-		t.utlsSessionCache = utls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
+		// crypto/tls and uTLS use incompatible session-state types, so their
+		// caches must remain separate even though they serve the same endpoint.
+		t.uClientSessionCache = utls.NewLRUClientSessionCache(snellECHSessionCacheCapacity)
+		t.disableRenegotiation = true
 	}
 
 	if option.TlsFragment {
@@ -239,13 +243,14 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 
 			uConfig := uTLSConfigFromTLSConfig(s.tlsConfig)
 			if s.snellECH {
-				configureUTLSSnellECH(uConfig, s.utlsSessionCache)
+				configureUTLSSnellECH(uConfig, s.uClientSessionCache)
 			}
 			if s.snellECH {
 				tlsConn = &utlsConnWrapper{
-					UConn:         utls.UClient(co, uConfig, *clientHelloID),
-					nextProtocols: append([]string(nil), uConfig.NextProtos...),
-					snellECH:      true,
+					UConn:                utls.UClient(co, uConfig, *clientHelloID),
+					nextProtocols:        append([]string(nil), uConfig.NextProtos...),
+					snellECH:             true,
+					disableRenegotiation: s.disableRenegotiation,
 				}
 			} else {
 				utlsConn, err := newUTLSClient(co, uConfig, *clientHelloID)
@@ -253,7 +258,10 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 					_ = rc.Close()
 					return nil, err
 				}
-				tlsConn = &utlsConnWrapper{UConn: utlsConn}
+				tlsConn = &utlsConnWrapper{
+					UConn:                utlsConn,
+					disableRenegotiation: s.disableRenegotiation,
+				}
 			}
 
 		default:

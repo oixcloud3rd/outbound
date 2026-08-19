@@ -30,14 +30,25 @@ func newUTLSClient(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*
 
 type utlsConnWrapper struct {
 	*utls.UConn
-	nextProtocols []string
-	snellECH      bool
+	nextProtocols        []string
+	snellECH             bool
+	disableRenegotiation bool
 }
 
 func (c *utlsConnWrapper) HandshakeContext(ctx context.Context) error {
-	if !c.snellECH {
+	if !c.snellECH && !c.disableRenegotiation {
 		return c.UConn.HandshakeContext(ctx)
 	}
+	if err := c.prepareClientHello(); err != nil {
+		return err
+	}
+	return c.UConn.HandshakeContext(ctx)
+}
+
+func (c *utlsConnWrapper) prepareClientHello() error {
+	// A fingerprint preset can overwrite Config.Renegotiation while building
+	// the ClientHello. Rewrite the resulting extension, as uTLS itself does not
+	// reapply that config field after the preset has been materialized.
 	if err := c.BuildHandshakeState(); err != nil {
 		return err
 	}
@@ -47,23 +58,26 @@ func (c *utlsConnWrapper) HandshakeContext(ctx context.Context) error {
 	for _, extension := range originalExtensions {
 		switch typed := extension.(type) {
 		case *utls.ALPNExtension:
-			foundALPN = true
-			typed.AlpnProtocols = append([]string(nil), c.nextProtocols...)
+			if c.snellECH {
+				foundALPN = true
+				typed.AlpnProtocols = append([]string(nil), c.nextProtocols...)
+			}
 		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
-			continue
+			if c.snellECH {
+				continue
+			}
 		case *utls.RenegotiationInfoExtension:
-			typed.Renegotiation = utls.RenegotiateNever
+			if c.disableRenegotiation {
+				typed.Renegotiation = utls.RenegotiateNever
+			}
 		}
 		extensions = append(extensions, extension)
 	}
-	if !foundALPN && len(c.nextProtocols) > 0 {
+	if c.snellECH && !foundALPN && len(c.nextProtocols) > 0 {
 		extensions = append(extensions, &utls.ALPNExtension{AlpnProtocols: append([]string(nil), c.nextProtocols...)})
 	}
 	c.Extensions = extensions
-	if err := c.BuildHandshakeState(); err != nil {
-		return err
-	}
-	return c.UConn.HandshakeContext(ctx)
+	return nil
 }
 
 func (c *utlsConnWrapper) TLSConnectionState() ConnectionState {
