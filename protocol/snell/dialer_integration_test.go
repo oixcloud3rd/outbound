@@ -188,6 +188,8 @@ func TestDialerExplicitIdentity(t *testing.T) {
 	require.NoError(t, err)
 	conn, err := dialer.DialContext(context.Background(), "tcp", "destination.example:443")
 	require.NoError(t, err)
+	_, err = conn.Write([]byte("identity"))
+	require.NoError(t, err)
 	prefix := <-prefixes
 	require.Equal(t, "DLSNID01", string(prefix[singSnell.SaltLen:singSnell.SaltLen+8]))
 	require.Equal(t, singSnell.IdentityHeaderFromPSK([]byte(testPSK)), prefix[singSnell.SaltLen+8:])
