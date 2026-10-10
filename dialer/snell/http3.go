@@ -18,6 +18,7 @@ import (
 	transportTLS "github.com/daeuniverse/outbound/transport/tls"
 	"github.com/olicesx/quic-go"
 	"github.com/olicesx/quic-go/http3"
+	"github.com/olicesx/quic-go/logging"
 )
 
 func (s *Snell) isHTTP3() bool { return s.Transport == "h3" || s.Transport == "auto" }
@@ -52,6 +53,12 @@ type http3Session struct {
 	packet    net.PacketConn
 	closeOnce sync.Once
 	refs      int // guarded by http3Dialer.mu
+	rtt       atomic.Int64
+}
+
+type http3PendingDial struct {
+	done chan struct{}
+	err  error // published by closing done
 }
 
 func (s *http3Session) close() {
@@ -78,7 +85,7 @@ type http3Dialer struct {
 	mu         sync.Mutex
 	current    *http3Session
 	sessions   map[*http3Session]struct{}
-	pending    chan struct{}
+	pending    *http3PendingDial
 	retryAfter time.Time
 }
 
@@ -131,26 +138,59 @@ func (d *http3Dialer) DialContext(ctx context.Context, network, _ string) (netpr
 	d.mu.Lock()
 	cooling := d.auto && d.now().Before(d.retryAfter)
 	d.mu.Unlock()
-	if !cooling {
+	var conn netproxy.Conn
+	var err error
+	switch {
+	case !d.auto:
 		attempt, end := context.WithTimeout(ctx, d.timeout)
-		conn, err := d.open(attempt, network)
+		conn, err = d.open(attempt, network)
 		end()
-		if err == nil {
-			return conn, nil
-		}
-		if !d.auto || ctx.Err() != nil {
-			return nil, err
-		}
-		d.mu.Lock()
-		d.retryAfter = d.now().Add(30 * time.Second)
-		d.mu.Unlock()
+	case cooling:
+		conn, err = d.fallback.DialContext(ctx, network, d.address)
+	default:
+		conn, err = raceSnellTransports(ctx, d.ctx, snellHTTP3Delay(d.smoothedRTT()), d.timeout,
+			func(ctx context.Context) (netproxy.Conn, error) {
+				return d.open(ctx, network)
+			},
+			func(ctx context.Context) (netproxy.Conn, error) {
+				return d.fallback.DialContext(ctx, network, d.address)
+			}, d.recordHTTP3Result)
 	}
-	conn, err := d.fallback.DialContext(ctx, network, d.address)
-	if err == nil && ctx.Err() != nil {
+	if err != nil {
+		return nil, err
+	}
+	err = ctx.Err()
+	if err == nil {
+		err = d.ctx.Err()
+	}
+	if err != nil {
 		_ = conn.Close()
-		return nil, ctx.Err()
+		return nil, err
 	}
-	return conn, err
+	return conn, nil
+}
+
+func (d *http3Dialer) smoothedRTT() time.Duration {
+	d.mu.Lock()
+	session := d.current
+	d.mu.Unlock()
+	if session == nil || session.conn.Context().Err() != nil {
+		return 0
+	}
+	return time.Duration(session.rtt.Load())
+}
+
+func (d *http3Dialer) recordHTTP3Result(success bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ctx.Err() != nil {
+		return
+	}
+	if success {
+		d.retryAfter = time.Time{}
+	} else {
+		d.retryAfter = d.now().Add(30 * time.Second)
+	}
 }
 
 func (d *http3Dialer) get(ctx context.Context, network string) (*http3Session, error) {
@@ -168,44 +208,60 @@ func (d *http3Dialer) get(ctx context.Context, network string) (*http3Session, e
 			d.mu.Unlock()
 			return s, nil
 		}
-		if wait := d.pending; wait != nil {
-			d.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-wait:
-				continue
-			}
+		pending := d.pending
+		if pending == nil {
+			pending = &http3PendingDial{done: make(chan struct{})}
+			d.pending = pending
+			// A caller owns only its wait, not the shared QUIC handshake.
+			attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.timeout)
+			stop := context.AfterFunc(d.ctx, cancel)
+			go func() {
+				defer cancel()
+				defer stop()
+				d.dialSession(attempt, network, pending)
+			}()
 		}
-		wait := make(chan struct{})
-		d.pending = wait
 		d.mu.Unlock()
-
-		s, err := d.connect(ctx, network)
-		d.mu.Lock()
-		if err == nil && (d.ctx.Err() != nil || ctx.Err() != nil) {
-			s.close()
-			err = net.ErrClosed
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-d.ctx.Done():
+			return nil, net.ErrClosed
+		case <-pending.done:
 		}
-		if err == nil {
-			s.refs = 1
-			d.current = s
-			d.sessions[s] = struct{}{}
-			context.AfterFunc(s.conn.Context(), func() {
-				s.close()
-				d.mu.Lock()
-				delete(d.sessions, s)
-				if d.current == s {
-					d.current = nil
-				}
-				d.mu.Unlock()
-			})
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		d.pending = nil
-		close(wait)
-		d.mu.Unlock()
-		return s, err
+		if pending.err != nil {
+			return nil, pending.err
+		}
 	}
+}
+
+func (d *http3Dialer) dialSession(ctx context.Context, network string, pending *http3PendingDial) {
+	s, err := d.connect(ctx, network)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err == nil && (d.ctx.Err() != nil || ctx.Err() != nil) {
+		s.close()
+		err = net.ErrClosed
+	}
+	if err == nil {
+		d.current = s
+		d.sessions[s] = struct{}{}
+		context.AfterFunc(s.conn.Context(), func() {
+			s.close()
+			d.mu.Lock()
+			delete(d.sessions, s)
+			if d.current == s {
+				d.current = nil
+			}
+			d.mu.Unlock()
+		})
+	}
+	pending.err = err
+	d.pending = nil
+	close(pending.done)
 }
 
 func (d *http3Dialer) connect(ctx context.Context, network string) (*http3Session, error) {
@@ -222,18 +278,24 @@ func (d *http3Dialer) connect(ctx context.Context, network string) (*http3Sessio
 	// chained UDP proxies, without bypassing their resolver or routing policy.
 	pc := &http3PacketConn{Conn: raw, peer: http3Addr(d.address)}
 	tr := &quic.Transport{Conn: pc, DisableAddrParsing: true}
+	s := &http3Session{transport: tr, packet: pc}
+	// This QUIC fork exposes RTT via tracing rather than ConnectionStats.
+	// Leave all transport tuning parameters at their library defaults.
 	conn, err := tr.Dial(ctx, pc.peer, d.tlsConfig.Clone(), &quic.Config{
-		HandshakeIdleTimeout: 10 * time.Second, MaxIdleTimeout: 30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: -1, MaxIncomingUniStreams: 3,
-		InitialStreamReceiveWindow: 64 * 1024, MaxStreamReceiveWindow: 4 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 1024 * 1024, MaxConnectionReceiveWindow: 16 * 1024 * 1024,
+		Tracer: func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
+			return &logging.ConnectionTracer{
+				UpdatedMetrics: func(rtt *logging.RTTStats, _, _ logging.ByteCount, _ int) {
+					s.rtt.Store(int64(rtt.SmoothedRTT()))
+				},
+			}
+		},
 	})
 	if err != nil {
 		_ = tr.Close()
 		_ = pc.Close()
 		return nil, err
 	}
-	s := &http3Session{conn: conn, transport: tr, packet: pc}
+	s.conn = conn
 	state := conn.ConnectionState().TLS
 	if !state.ECHAccepted || state.NegotiatedProtocol != http3.NextProtoH3 {
 		s.close()
@@ -261,7 +323,6 @@ func (d *http3Dialer) open(ctx context.Context, network string) (_ netproxy.Conn
 	var tunnel *http3Conn
 	defer func() {
 		if err != nil {
-			d.retire(s)
 			if tunnel != nil {
 				_ = tunnel.Close()
 			} else {
@@ -281,6 +342,9 @@ func (d *http3Dialer) open(ctx context.Context, network string) (_ netproxy.Conn
 	}
 	stream, err := s.client.OpenRequestStream(ctx)
 	if err != nil {
+		if ctx.Err() == nil {
+			d.retire(s)
+		}
 		return nil, err
 	}
 	tunnel = &http3Conn{RequestStream: stream, session: s}
@@ -313,6 +377,9 @@ func (d *http3Dialer) open(ctx context.Context, network string) (_ netproxy.Conn
 		return nil, err
 	}
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusServiceUnavailable {
+			d.retire(s)
+		}
 		return nil, fmt.Errorf("snell: HTTP/3 CONNECT status %d", response.StatusCode)
 	}
 	_ = stream.SetDeadline(time.Time{})

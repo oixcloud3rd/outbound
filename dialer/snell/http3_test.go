@@ -109,6 +109,43 @@ func TestHTTP3Fallback(t *testing.T) {
 	_, err = transport.DialContext(ctx, "tcp", "")
 	require.ErrorIs(t, err, context.Canceled)
 	require.NoError(t, d.Close())
+
+	t.Run("TCP winner leaves a reusable H3 session", func(t *testing.T) {
+		_, transport, requests := newHTTP3Fixture(t, "auto", http.StatusOK)
+		next := transport.next
+		proceed := make(chan struct{})
+		var dials atomic.Int32
+		transport.next = http3DialFunc(func(ctx context.Context, network, address string) (netproxy.Conn, error) {
+			dials.Add(1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-proceed:
+				return next.DialContext(ctx, network, address)
+			}
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		conn, err := transport.DialContext(ctx, "tcp", "")
+		require.NoError(t, err)
+		require.IsType(t, &tls.Conn{}, conn)
+		require.NoError(t, conn.Close())
+		close(proceed)
+		require.Eventually(t, func() bool {
+			transport.mu.Lock()
+			defer transport.mu.Unlock()
+			return requests.Load() == 1 && transport.current != nil && transport.current.refs == 0
+		}, 2*time.Second, 10*time.Millisecond)
+		conn, err = transport.DialContext(ctx, "tcp", "")
+		require.NoError(t, err)
+		require.IsType(t, &http3Conn{}, conn)
+		require.NoError(t, conn.Close())
+		require.EqualValues(t, 1, dials.Load(), "late H3 probe warms the shared session")
+		transport.mu.Lock()
+		cooling := !transport.retryAfter.IsZero()
+		transport.mu.Unlock()
+		require.False(t, cooling)
+	})
 }
 
 type blockingHTTP3Dialer struct{}

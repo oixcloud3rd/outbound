@@ -63,10 +63,19 @@ remain available. H3 uses Go TLS 1.3 with `h3` ALPN and requires accepted ECH.
 uTLS, fingerprint and TLS fragmentation settings apply only to TCP fallback.
 
 `h3` allows 10 seconds to establish a tunnel and never falls back. `auto`
-allows 2 seconds, then falls back to certificate-verified ECH-TLS TCP at the
-same address and port. New tunnels use TCP for 30 seconds before trying H3
-again. Shorter caller deadlines take precedence. Fallback retains Identity v2,
-defaults to `snell-ech/1` ALPN, and never retries after sending Snell data.
+follows the Snell Happy Eyeballs implementation in `oixcloud3rd/sing-box`: start H3
+first, then race certificate-verified ECH-TLS TCP at the same address and port
+after 250 ms without a live session, or twice its smoothed RTT clamped to
+100-1000 ms with a live session. H3 failure starts TCP immediately.
+The first successful transport wins. If TCP wins, H3 continues probing within
+its original 2-second budget: success keeps the QUIC session warm and clears
+cooldown; failure starts a 30-second cooldown. The unused H3 stream is closed.
+If H3 wins, TCP is canceled and any late connection is closed. Caller cancellation
+before a winner stops the race; closing the dialer also stops background probes.
+Shared QUIC handshakes have their own bounded lifetime so one canceled waiter
+does not cancel others. Only the winner sends Snell data.
+TCP retains Identity v2 and defaults to `snell-ech/1` ALPN. QUIC transport
+parameters use library defaults rather than custom receive windows or keepalive.
 
 Congestion control affects only client QUIC sending:
 `cc_override` takes precedence over `congestion_control`, then the default
