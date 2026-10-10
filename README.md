@@ -21,7 +21,7 @@ from a direct share link. v6 supports `default`, `unshaped`, and `unsafe-raw`
 modes; its PSK must contain 12–255 bytes and it cannot be combined with
 obfuscation, identity, or preconnect.
 
-ECH-TLS carries the Snell v4 wire directly over TLS 1.3 with ECH. No HTTP/2 or
+By default, ECH-TLS carries the Snell v4 wire directly over TLS 1.3 with ECH. No HTTP/2 or
 WebSocket framing is added after the handshake. Existing direct links that omit
 `alpn` keep the legacy `h2` value; new configurations should explicitly use
 `alpn=snell-ech/1` and Identity v2:
@@ -42,3 +42,37 @@ certificate, and authentication failures are never retried as legacy traffic.
 The deprecated `protocol=oix-snell/1` value is normalized to `snell-ech/1`.
 Legacy `path`, `obfs-uri`, and `ws-host` query parameters are accepted but
 ignored and omitted from canonical exports.
+
+### HTTP/3 transport
+
+`transport=tcp` (also the default), `transport=h3`, and `transport=auto` select
+the underlay. H3 is a custom HTTP/3 Extended CONNECT tunnel, **not** official
+Snell v5 QUIC mode. It requires v4/v5-compatible wire, `obfs=ech-tls`,
+explicit `identity=2`, a valid `ech-config`, and certificate verification.
+It cannot be combined with v6 or `legacy-fallback=true`.
+
+```text
+snell://psk@server.example:443?version=4&obfs=ech-tls&transport=auto&identity=2&sni=origin.example&ech-config=<url-encoded-base64>&reuse=true&preconnect=1&congestion_control=bbr3#h3
+```
+
+The server must accept Extended CONNECT with `:protocol=websocket` at
+`/ws-tunnel-` followed by the lowercase hex of the first 12 bytes of
+SHA-256(PSK). The tunnel carries raw Snell bytes, without WebSocket frames.
+TCP and UDP proxy traffic share QUIC sessions; Snell reuse and preconnect
+remain available. H3 uses Go TLS 1.3 with `h3` ALPN and requires accepted ECH.
+uTLS, fingerprint and TLS fragmentation settings apply only to TCP fallback.
+
+`h3` allows 10 seconds to establish a tunnel and never falls back. `auto`
+allows 2 seconds, then falls back to certificate-verified ECH-TLS TCP at the
+same address and port. New tunnels use TCP for 30 seconds before trying H3
+again. Shorter caller deadlines take precedence. Fallback retains Identity v2,
+defaults to `snell-ech/1` ALPN, and never retries after sending Snell data.
+
+Congestion control affects only client QUIC sending:
+`cc_override` takes precedence over `congestion_control`, then the default
+**experimental BBR3**. Supported values are `bbr`, `bbr3`, `brutal`, and
+`reno` (`new_reno` is an alias). Unknown `congestion_control` values, including
+the currently unimplemented `cubic`, warn at dialer construction and use BBR3;
+unknown `cc_override` values are errors. `cwnd` is in bytes/second: a required
+positive target rate for Brutal, or an optional upper-bound hint for BBR3.
+BBR profiles are not supported; explicit `bbr_profile`/`bbr-profile` is rejected.

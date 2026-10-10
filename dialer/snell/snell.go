@@ -53,6 +53,10 @@ type Snell struct {
 	SkipVerifyExplicit bool
 	TLSImplementation  string
 	ClientFingerprint  string
+	Transport          string
+	CongestionControl  string
+	CCOverride         string
+	Cwnd               int
 
 	// Deprecated: raw ECH-TLS does not use a WebSocket Host header.
 	WSHost string
@@ -81,6 +85,13 @@ func ParseURL(link string) (*Snell, error) {
 		return nil, fmt.Errorf("snell: invalid port")
 	}
 	query := u.Query()
+	if query.Has("bbr-profile") || query.Has("bbr_profile") {
+		return nil, fmt.Errorf("snell: BBR profiles are not supported")
+	}
+	cwnd, err := parseInt(query, 0, "cwnd")
+	if err != nil {
+		return nil, err
+	}
 	version := protocolSnell.Version4
 	if value := query.Get("version"); value != "" {
 		version, err = strconv.Atoi(value)
@@ -144,6 +155,13 @@ func ParseURL(link string) (*Snell, error) {
 		SkipVerifyExplicit: skipVerifyExplicit,
 		TLSImplementation:  tlsImplementation,
 		ClientFingerprint:  clientFingerprint,
+		Transport:          strings.ToLower(strings.TrimSpace(query.Get("transport"))),
+		CongestionControl:  strings.ToLower(strings.TrimSpace(query.Get("congestion_control"))),
+		CCOverride:         strings.ToLower(strings.TrimSpace(query.Get("cc_override"))),
+		Cwnd:               cwnd,
+	}
+	if configuration.isHTTP3() && configuration.ALPN == "" {
+		configuration.ALPN = snellECHTLSALPN
 	}
 	if configuration.ECHConfig != "" {
 		decoded, decodeErr := transportTLS.DecodeECHConfigList(configuration.ECHConfig)
@@ -170,6 +188,23 @@ func (s *Snell) validate() error {
 	}
 	if s.Preconnect < 0 || s.Preconnect > 4 {
 		return fmt.Errorf("snell: preconnect must be between 0 and 4")
+	}
+	switch s.Transport {
+	case "", "tcp":
+		if s.CongestionControl != "" || s.CCOverride != "" || s.Cwnd != 0 {
+			return fmt.Errorf("snell: congestion options require transport=h3 or auto")
+		}
+	case "h3", "auto":
+		if s.Version != protocolSnell.Version4 && s.Version != protocolSnell.Version5 ||
+			s.Obfs != "ech-tls" || s.Identity != protocolSnell.IdentityV2 || !s.IdentityExplicit ||
+			s.LegacyFallback || s.ALPN == snellECHTLSLegacyALPN {
+			return fmt.Errorf("snell: HTTP/3 requires v4/v5, ECH-TLS and explicit identity 2 without legacy fallback")
+		}
+		if _, _, err := s.http3CongestionControl(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("snell: unsupported transport %q", s.Transport)
 	}
 	switch s.Version {
 	case protocolSnell.Version4, protocolSnell.Version5:
@@ -231,6 +266,13 @@ func (s *Snell) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 		return nil, nil, err
 	}
 	address := net.JoinHostPort(s.Server, strconv.Itoa(s.Port))
+	if s.isHTTP3() {
+		current, err := newHTTP3SnellDialer(s, option, nextDialer, address)
+		if err != nil {
+			return nil, nil, err
+		}
+		return current, &dialer.Property{Name: s.Name, Address: address, Protocol: "snell", Link: s.ExportToURL()}, nil
+	}
 	primaryALPN := s.ALPN
 	if s.Obfs == "ech-tls" && primaryALPN == "" {
 		// Preserve the implicit h2 behavior of existing direct share links.
@@ -271,6 +313,7 @@ func (s *Snell) newProtocolDialer(
 ) (netproxy.Dialer, error) {
 	current := nextDialer
 	protocolObfs := s.Obfs
+	var h3 *http3Dialer
 	if s.Obfs == "ech-tls" {
 		tlsURL := s.echTLSURL(option, address, alpn)
 		var err error
@@ -280,8 +323,15 @@ func (s *Snell) newProtocolDialer(
 		}
 		current = &echTLSDialer{Dialer: current, alpn: alpn}
 		protocolObfs = "none"
+		if s.isHTTP3() {
+			h3, err = newHTTP3Dialer(s, nextDialer, current, address)
+			if err != nil {
+				return nil, err
+			}
+			current = h3
+		}
 	}
-	return protocol.NewDialer("snell", current, protocol.Header{
+	result, err := protocol.NewDialer("snell", current, protocol.Header{
 		ProxyAddress: address,
 		Password:     s.PSK,
 		IsClient:     true,
@@ -297,6 +347,14 @@ func (s *Snell) newProtocolDialer(
 			ObfsHost:   s.ObfsHost,
 		},
 	})
+	if h3 != nil {
+		if err != nil {
+			_ = h3.Close()
+		} else {
+			return &ownedHTTP3Dialer{managedSnellDialer: result.(managedSnellDialer), transport: h3}, nil
+		}
+	}
+	return result, err
 }
 
 func (s *Snell) ExportToURL() string {
@@ -308,6 +366,18 @@ func (s *Snell) ExportToURL() string {
 	}
 	query := u.Query()
 	query.Set("version", strconv.Itoa(s.Version))
+	if s.Transport != "" {
+		query.Set("transport", s.Transport)
+	}
+	if s.CongestionControl != "" {
+		query.Set("congestion_control", s.CongestionControl)
+	}
+	if s.CCOverride != "" {
+		query.Set("cc_override", s.CCOverride)
+	}
+	if s.Cwnd != 0 {
+		query.Set("cwnd", strconv.Itoa(s.Cwnd))
+	}
 	if s.UserKey != "" {
 		query.Set("userkey", s.UserKey)
 	}

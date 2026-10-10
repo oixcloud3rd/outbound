@@ -20,6 +20,8 @@ func TestParseAndExportURL(t *testing.T) {
 		"snell://p%40ss@[2001:db8::1]:8443?version=5&reuse=true&identity=true&obfs=http&obfs-host=cdn.example#v5",
 		"snell://123456789012@example.com:443?version=6&mode=unshaped&userkey=user#v6",
 		"snell://password@example.com:443?version=4&obfs=ech-tls&sni=origin.example&ech-config=AAQ%2BDAAA#ech",
+		"snell://password@example.com:443?version=5&obfs=ech-tls&identity=2&transport=h3&congestion_control=bbr&ech-config=AAQ%2BDAAA#h3",
+		"snell://password@example.com:443?obfs=ech-tls&identity=2&transport=auto&congestion_control=future&cc_override=bbr3&cwnd=1000&ech-config=AAQ%2BDAAA#auto",
 	}
 	for _, link := range tests {
 		configuration, err := ParseURL(link)
@@ -28,6 +30,38 @@ func TestParseAndExportURL(t *testing.T) {
 		reparsed, err := ParseURL(exported)
 		require.NoError(t, err, exported)
 		require.Equal(t, configuration, reparsed)
+	}
+}
+
+func TestHTTP3Options(t *testing.T) {
+	base := "snell://password@example.com:443?obfs=ech-tls&ech-config=AAQ%2BDAAA&transport=h3"
+	for _, tc := range []struct {
+		query string
+		cc    string
+		warn  bool
+	}{
+		{"&identity=2", "bbr3", false},
+		{"&identity=2&congestion_control=new_reno", "reno", false},
+		{"&identity=2&congestion_control=cubic", "bbr3", true},
+		{"&identity=2&congestion_control=future&cc_override=bbr", "bbr", false},
+		{"&identity=2&congestion_control=brutal&cwnd=1000", "brutal", false},
+	} {
+		s, err := ParseURL(base + tc.query)
+		require.NoError(t, err)
+		cc, warn, err := s.http3CongestionControl()
+		require.NoError(t, err)
+		require.Equal(t, tc.cc, cc)
+		require.Equal(t, tc.warn, warn)
+		require.Equal(t, snellECHTLSALPN, s.ALPN)
+	}
+	for _, query := range []string{
+		"", "&identity=1", "&identity=2&legacy-fallback=true",
+		"&identity=2&cc_override=cubic", "&identity=2&congestion_control=brutal",
+		"&identity=2&cwnd=-1", "&identity=2&bbr_profile=standard",
+		"&identity=2&skip-cert-verify=true", "&identity=2&version=6",
+	} {
+		_, err := ParseURL(base + query)
+		require.Error(t, err, query)
 	}
 }
 
